@@ -1,8 +1,8 @@
 /* Spielhafen – Etappen-Rommé & Schiffe versenken: Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.7.3';
-const PROTO=7;                   // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
+const APP_VERSION='1.8.1';
+const PROTO=8;                  // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
 const MAX_MSG_PER_SEC=25;
@@ -28,7 +28,7 @@ const PHASES=[
 const GNAME={set:n=>({2:'Zwilling',3:'Drilling',4:'Vierling',5:'Fünfling'}[n]||n+' Gleiche'), run:n=>'Folge von '+n, color:n=>n+' einer Farbe'};
 const $=id=>document.getElementById(id);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const LS_KEYS=['etappen-name','etappen-token','etappen-setup','etappen-host','etappen-last','etappen-avatar','etappen-theme','etappen-anim'];
+const LS_KEYS=['etappen-name','etappen-token','etappen-setup','etappen-host','etappen-last','etappen-avatar','etappen-theme','etappen-anim','etappen-setup-sv','etappen-setup-mm','etappen-mmrules','etappen-mmsel'];
 const lsGet=k=>{try{return localStorage.getItem(k);}catch(e){return null;}};
 const lsSet=(k,v)=>{try{localStorage.setItem(k,v);}catch(e){}};
 const lsDel=k=>{try{localStorage.removeItem(k);}catch(e){}};
@@ -600,32 +600,34 @@ const fmtCode=c=>c.slice(0,4)+'-'+c.slice(4);
 const cryptoOK=()=>{ if(!(window.crypto&&crypto.subtle)){ toast('Dein Browser unterstützt die Verschlüsselung nicht. Bitte aktualisiere ihn.'); return false; } return true; };
 function hostSave(){
   if(!HOST) return;
-  lsSet('etappen-host',JSON.stringify({code:HOST.code,game:HOST.game,status:HOST.status,seats:HOST.seats,G,SV,ts:Date.now()}));
+  lsSet('etappen-host',JSON.stringify({code:HOST.code,game:HOST.game,rules:HOST.rules,status:HOST.status,seats:HOST.seats,G,SV,MM,ts:Date.now()}));
 }
 function savedHost(){ try{ const s=JSON.parse(lsGet('etappen-host')); if(s&&CODE_RE.test(s.code)&&Date.now()-s.ts<48*3600e3) return s; }catch(e){} return null; }
 function rateOK(c){ const now=Date.now(); if(!c._t||now-c._t>1000){c._t=now;c._n=0;} return ++c._n<=MAX_MSG_PER_SEC; }
 const isOnline=c=>Date.now()-c.last<35000;
 
-const GAME_NAME={etappen:'Etappen-Rommé',schiffe:'Schiffe versenken'};
+const GAME_NAME={etappen:'Etappen-Rommé',schiffe:'Schiffe versenken',maumau:'Mau-Mau'};
+const normGame=g=>g==='schiffe'||g==='maumau'?g:'etappen';
 const maxSeats=()=>HOST&&HOST.game==='schiffe'?2:6;
 async function hostGame(resume,game){
   if(!cryptoOK()) return;
   const name=readName(); if(!resume&&!name){toast('Bitte gib zuerst deinen Namen ein.'); return;}
-  stopNet(); G=null; SV=null; SVV=null; mode='local'; render();
+  stopNet(); G=null; SV=null; SVV=null; MM=null; MMV=null; mode='local'; render();
   overlay(`<h2>Raum wird geöffnet …</h2><p class="note">Verschlüsselung wird vorbereitet.</p>`,'wait');
   const code=resume?resume.code:newCode();
   const keys=await roomKeys(code), ecdh=await newECDH();
   mode='host';
-  const g=resume?(resume.game==='schiffe'?'schiffe':'etappen'):(game==='schiffe'?'schiffe':'etappen');
-  HOST={code,keys,ecdh,game:g,status:resume?resume.status:'lobby',seats:resume?resume.seats:[{tok:myTok,name,ai:false,av:myAv}],clients:new Map()};
+  const g=normGame(resume?resume.game:game);
+  HOST={code,keys,ecdh,game:g,rules:g==='maumau'?(resume&&resume.rules?mmCleanRules(resume.rules):mmRules()):null,status:resume?resume.status:'lobby',seats:resume?resume.seats:[{tok:myTok,name,ai:false,av:myAv}],clients:new Map()};
   const mine=HOST.seats.find(s=>s.tok===myTok); if(mine){ mine.av=myAv; if(HOST.status==='lobby'&&name) mine.name=name; }
   G=resume&&resume.status==='game'&&g==='etappen'?resume.G:null;
   SV=resume&&resume.status==='game'&&g==='schiffe'?resume.SV:null;
-  if(HOST.status==='game'&&!G&&!SV) HOST.status='lobby';
+  MM=resume&&resume.status==='game'&&g==='maumau'?resume.MM:null;
+  if(HOST.status==='game'&&!G&&!SV&&!MM) HOST.status='lobby';
   netStart(keys,keys.topic+'/h',hostOnEnv);
   hostSave(); keepAwake();
   hostTimer=setInterval(hostTick,10000);
-  if(HOST.status==='lobby'){ render(); showLobby(); } else { overlay(''); if(SV) svChanged(); else changed(); }
+  if(HOST.status==='lobby'){ render(); showLobby(); } else { overlay(''); if(SV) svChanged(); else if(MM) mmChanged(); else changed(); }
 }
 function hostTick(){
   if(mode!=='host'||!HOST) return;
@@ -662,7 +664,7 @@ async function hostOnEnv(env){
   c.last=Date.now();
   hostOnMsg(c,msg);
 }
-function seatOf(c){ const S=HOST&&HOST.game==='schiffe'?SV:G; if(!S||!c.tok) return null; const i=S.players.findIndex(p=>p.tok===c.tok); return i<0?null:i; }
+function seatOf(c){ const S=HOST&&HOST.game==='schiffe'?SV:HOST&&HOST.game==='maumau'?MM:G; if(!S||!c.tok) return null; const i=S.players.findIndex(p=>p.tok===c.tok); return i<0?null:i; }
 function onlineToks(){ const s=new Set([myTok]); HOST&&HOST.clients.forEach(c=>{ if(c.tok&&isOnline(c)) s.add(c.tok); }); return s; }
 function onlineCount(){ let n=0; HOST&&HOST.clients.forEach(c=>{ if(c.tok&&isOnline(c)) n++; }); return n; }
 function viewFor(seat){
@@ -674,7 +676,8 @@ function viewFor(seat){
 }
 function hostSendView(c){
   if(!HOST||!c.tok) return;
-  if(HOST.status==='lobby') hostSend(c,{t:'lobby',v:PROTO,game:HOST.game,code:HOST.code,seats:HOST.seats.map(s=>({name:s.name,ai:s.ai,av:s.av,me:s.tok===c.tok,host:s.tok===myTok}))});
+  if(HOST.status==='lobby') hostSend(c,{t:'lobby',v:PROTO,game:HOST.game,rules:HOST.rules,code:HOST.code,seats:HOST.seats.map(s=>({name:s.name,ai:s.ai,av:s.av,me:s.tok===c.tok,host:s.tok===myTok}))});
+  else if(HOST.game==='maumau'){ if(!MM) return; const seat=seatOf(c); hostSend(c,{t:'mm',v:PROTO,sn:++c.sn,ack:c.lastSeq,you:seat,view:mmView(seat),hostName:HOST.seats[0].name}); }
   else if(HOST.game==='schiffe'){ if(!SV) return; const seat=seatOf(c); hostSend(c,{t:'sv',v:PROTO,sn:++c.sn,ack:c.lastSeq,you:seat,view:svView(seat),hostName:HOST.seats[0].name}); }
   else { const seat=seatOf(c); hostSend(c,{t:'state',v:PROTO,sn:++c.sn,ack:c.lastSeq,you:seat,view:viewFor(seat),hostName:HOST.seats[0].name}); }
 }
@@ -708,8 +711,8 @@ function hostOnMsg(c,d){
     if(seq&&seq<=c.lastSeq){ hostSendView(c); return; }   // doppelt angekommen
     c.lastSeq=seq;
     const seat=seatOf(c); if(seat===null) return;
-    const err=HOST.game==='schiffe'?svApply(seat,d.a):applyAction(seat,d.a);
-    if(err){ hostSend(c,{t:'err',msg:err,ack:seq}); hostSendView(c); } else if(HOST.game==='schiffe') svChanged(); else changed();
+    const err=HOST.game==='schiffe'?svApply(seat,d.a):HOST.game==='maumau'?mmApply(seat,d.a):applyAction(seat,d.a);
+    if(err){ hostSend(c,{t:'err',msg:err,ack:seq}); hostSendView(c); } else if(HOST.game==='schiffe') svChanged(); else if(HOST.game==='maumau') mmChanged(); else changed();
   }
 }
 function hostStart(){
@@ -720,7 +723,12 @@ function hostStart(){
     SV=svNew(HOST.seats.map(s=>({name:s.name,av:s.av,tok:s.tok})));
     overlay(''); svChanged(); return;
   }
-  HOST.status='game'; SV=null;
+  if(HOST.game==='maumau'){
+    HOST.status='game'; G=null; SV=null; mmMauArmed=false;
+    MM=mmNew(HOST.seats.map(s=>({name:s.name,av:s.av,ai:s.ai,tok:s.ai?null:s.tok})),HOST.rules||mmRules());
+    overlay(''); mmChanged(); return;
+  }
+  HOST.status='game'; SV=null; MM=null;
   G=newGameState(HOST.seats.map(s=>({name:s.name,ai:s.ai,tok:s.ai?null:s.tok,av:s.av})));
   overlay(''); startRound(); changed();
 }
@@ -730,7 +738,7 @@ async function joinGame(codeRaw){
   if(!cryptoOK()) return;
   const name=readName(); if(!name){toast('Bitte gib zuerst deinen Namen ein.'); return;}
   const code=normCode(codeRaw); if(!CODE_RE.test(code)){toast(`Der Raum-Code hat ${CODE_LEN} Zeichen, zum Beispiel ABCD-2345.`); return;}
-  stopNet(); G=null; SV=null; SVV=null; mode='client'; render();
+  stopNet(); G=null; SV=null; SVV=null; MM=null; MMV=null; mode='client'; render();
   overlay(`<h2>Verbinde mit Raum ${fmtCode(code)} …</h2><p class="note">Das dauert meist nur ein paar Sekunden.</p><div class="row"><button class="btn" id="toMenu">Abbrechen</button></div>`,'wait');
   const keys=await roomKeys(code), ecdh=await newECDH();
   if(mode!=='client') return;   // inzwischen abgebrochen
@@ -786,22 +794,29 @@ async function clientOnEnv(env){
 function clientOnData(d){
   const C=CLIENT; if(!C) return;
   if(d.ack!=null&&C.pending&&int(d.ack,0,1e9,0)>=C.pending.seq) C.pending=null;
-  if((d.t==='lobby'||d.t==='state'||d.t==='sv')&&d.v!==PROTO){ toast('Deine App-Version passt nicht zu der des Gastgebers. Bitte beide die App aktualisieren.'); return; }
+  if((d.t==='lobby'||d.t==='state'||d.t==='sv'||d.t==='mm')&&d.v!==PROTO){ toast('Deine App-Version passt nicht zu der des Gastgebers. Bitte beide die App aktualisieren.'); return; }
+  if(d.t==='mm'){
+    const sn=int(d.sn,0,1e12,0); if(sn&&sn<=C.sn) return; C.sn=sn;
+    const v=sanitizeMmView(d.view); if(!v) return;
+    G=null; SVV=null; MMV=v; C.you=v.you; C.hostName=str(d.hostName,16);
+    if(['lobby','wait','notfound'].includes(ovKey)) overlay('');
+    render(); return;
+  }
   if(d.t==='sv'){
     const sn=int(d.sn,0,1e12,0); if(sn&&sn<=C.sn) return; C.sn=sn;
     const v=sanitizeSvView(d.view); if(!v) return;
-    G=null; SVV=v; C.you=d.you==null?null:int(d.you,0,1,null); C.hostName=str(d.hostName,16);
+    G=null; MMV=null; SVV=v; C.you=d.you==null?null:int(d.you,0,1,null); C.hostName=str(d.hostName,16);
     if(['lobby','wait','notfound'].includes(ovKey)) overlay('');
     render(); return;
   }
   if(d.t==='lobby'){
-    C.lobby={code:C.code,game:d.game==='schiffe'?'schiffe':'etappen',seats:(Array.isArray(d.seats)?d.seats:[]).slice(0,6).map(s=>({name:str(s&&s.name,16)||'?',ai:!!(s&&s.ai),av:cleanAv(s&&s.av),me:!!(s&&s.me),host:!!(s&&s.host)}))};
-    G=null; SV=null; SVV=null; render(); if(['wait','lobby','notfound'].includes(ovKey)||!ovKey) showLobby(); return;
+    C.lobby={code:C.code,game:normGame(d.game),rules:d.game==='maumau'?mmCleanRules(d.rules):null,seats:(Array.isArray(d.seats)?d.seats:[]).slice(0,6).map(s=>({name:str(s&&s.name,16)||'?',ai:!!(s&&s.ai),av:cleanAv(s&&s.av),me:!!(s&&s.me),host:!!(s&&s.host)}))};
+    G=null; SV=null; SVV=null; MM=null; MMV=null; render(); if(['wait','lobby','notfound'].includes(ovKey)||!ovKey) showLobby(); return;
   }
   if(d.t==='state'){
     const sn=int(d.sn,0,1e12,0); if(sn&&sn<=C.sn) return; C.sn=sn;
     const v=sanitizeView(d.view); if(!v) return;
-    G=v; SVV=null; C.you=d.you==null?null:int(d.you,0,v.players.length-1,null); C.hostName=str(d.hostName,16);
+    G=v; SVV=null; MMV=null; C.you=d.you==null?null:int(d.you,0,v.players.length-1,null); C.hostName=str(d.hostName,16);
     if(['lobby','wait','notfound'].includes(ovKey)) overlay('');
     render(); return;
   }
@@ -819,7 +834,7 @@ function showNotFound(){
   if(mode!=='client'||!CLIENT) return;
   overlay(`<h2>Raum nicht erreichbar</h2><p>Prüfe den Code. Der Gastgeber muss die App gerade geöffnet haben.</p><p class="note">Ich versuche es im Hintergrund weiter.</p><div class="row mt"><button class="btn primary" id="keepTrying">Weiter warten</button><button class="btn" id="toMenu">Zum Menü</button></div>`,'notfound');
 }
-function leaveToMenu(){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; SV=null; SVV=null; render(); showMenu(); }
+function leaveToMenu(){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; SV=null; SVV=null; MM=null; MMV=null; render(); showMenu(); }
 
 /* Bildschirm wach halten, solange online gespielt wird */
 let wakeLock=null;
@@ -959,8 +974,32 @@ const svActive=()=>mode==='client'?!!SVV:!!SV;
 function svSeat(){
   if(mode==='client') return CLIENT&&CLIENT.you!=null?CLIENT.you:null;
   if(!SV) return null;
-  if(mode==='local') return 0;
+  if(mode==='local') return svViewer;
   const i=SV.players.findIndex(p=>p.tok===myTok); return i<0?null:i;
+}
+/* An einem Gerät: wer schaut gerade aufs Meer? Bei zwei Menschen wird dazwischen verdeckt. */
+let svViewer=0, svPendViewer=null, svCoverT=null;
+function svWantViewer(){
+  if(SV.phase==='place'){ const i=SV.players.findIndex(p=>!p.ai&&!p.ready); return i>=0?i:svViewer; }
+  if(SV.phase==='play'&&!SV.players[SV.cur].ai) return SV.cur;
+  return svViewer;
+}
+function svUpdateViewer(){
+  if(mode!=='local'||!SV) return;
+  const want=svWantViewer(); if(want===svViewer||want===svPendViewer) return;
+  if(SV.players.filter(p=>!p.ai).length<=1){ svViewer=want; return; }
+  svPendViewer=want; clearTimeout(svCoverT);
+  svCoverT=setTimeout(()=>{ if(SV&&svPendViewer!=null&&(!ovKey||ovKey==='svcover')) showSvCover(); }, animOff?100:(SV.phase==='place'?300:1300));
+}
+function showSvCover(){
+  const p=SV.players[svPendViewer]; if(!p) return;
+  overlay(`<div class="center-av">${avatarSVG(p.av,84,'av av-xl')}</div><h2>Weitergeben an ${esc(p.name)}</h2><p>${SV.phase==='place'?'Jetzt stellt '+esc(p.name)+' die Flotte auf. Die anderen bitte wegschauen.':'Die anderen bitte wegschauen.'}</p><div class="row"><button class="btn primary" id="svUncover">Ich bin ${esc(p.name)} – los geht's</button></div>`,'svcover');
+}
+function svStartLocal(cfg){
+  mode='local'; G=null; SVV=null; MM=null; MMV=null; covered=false; svMode={abil:null,dir:'h'}; svPendViewer=null; svDraft=null;
+  SV=svNew(cfg.slice(0,2).map(p=>({name:p.name,av:p.av,ai:p.ai})));
+  const h=SV.players.findIndex(p=>!p.ai); svViewer=h>=0?h:0;
+  overlay(''); svChanged();
 }
 function svCellsOf(r,c,len,h){ const out=[]; for(let i=0;i<len;i++){ const rr=h?r:r+i, cc=h?c+i:c; if(rr<0||cc<0||rr>=SV_N||cc>=SV_N) return null; out.push([rr,cc]); } return out; }
 function svArea(r,c){ const out=[]; for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){ const rr=r+dr, cc=c+dc; if(rr>=0&&cc>=0&&rr<SV_N&&cc<SV_N) out.push([rr,cc]); } return out; }
@@ -1143,19 +1182,18 @@ function maybeSvAI(){
     if(a._cand){ const p=a._cand[randInt(a._cand.length)]; a={type:'shoot',r:p[0],c:p[1]}; }
     svApply(seat,a); svChanged(); }, animOff?400:1000);
 }
-function svChanged(){ if(mode==='host'){ hostBroadcast(); hostSave(); } render(); maybeSvAI(); }
+function svChanged(){ if(mode==='local') svUpdateViewer(); if(mode==='host'){ hostBroadcast(); hostSave(); } render(); maybeSvAI(); }
 function svAct(a){
   if(mode==='client'){ if(!hostReachable()){ toast('Keine Verbindung zum Gastgeber – ich versuche es weiter …'); return; } clientAct(a); return; }
   const err=svApply(svSeat(),a); if(err){ toast(err); return; }
   svChanged();
 }
 function svStartVsCpu(){
-  readName(); stopNet(); mode='local'; G=null; SVV=null; covered=false; svMode={abil:null,dir:'h'};
-  SV=svNew([{name:myName||'Du',av:myAv},{name:'Computer',av:randomAv(),ai:true}]);
-  overlay(''); svChanged();
+  readName(); stopNet();
+  svStartLocal([{name:myName||'Du',av:myAv},{name:'Computer',av:randomAv(),ai:true}]);
 }
 function svDraftFor(V){
-  const key=V.round+'|'+mode;
+  const key=V.round+'|'+mode+'|'+svSeat();
   if(!svDraft||svDraft.key!==key) svDraft={key,ships:SV_FLEET.map(len=>({len,cells:null})),sel:0,horiz:true};
   return svDraft;
 }
@@ -1190,7 +1228,8 @@ function svFleetHTML(sunkLens){
 function renderSV(){
   const V=curSvView(); if(!V) return;
   const me=svSeat(), oi=me!=null?1-me:1, meP=me!=null?V.players[me]:null, op=V.players[oi];
-  const placing=V.phase==='place'&&meP&&!meP.ready, myTurn=V.phase==='play'&&V.cur===me;
+  const hold=mode==='local'&&svPendViewer!=null;
+  const placing=V.phase==='place'&&meP&&!meP.ready&&!hold, myTurn=V.phase==='play'&&V.cur===me&&!hold;
   if(!myTurn) svMode.abil=null;
   $('roundInfo').textContent=`Schiffe versenken · Spiel ${V.round}`;
   $('svPlayers').innerHTML=[me!=null?me:0, oi].map(i=>{ const p=V.players[i]; return `<div class="sv-pl${V.phase==='play'&&V.cur===i?' cur':''}">${avatarSVG(p.av,40)}<div class="sv-pl-in"><b>${esc(p.name)}${i===me?' <span class="pl-meta">· du</span>':''}</b><div class="pl-meta">${V.phase==='place'?(p.ready?'bereit ✓':'stellt auf …'):`${p.left}/${SV_FLEET.length} Schiffe übrig`}</div>${V.phase!=='place'?`<div class="energy" aria-label="Energie ${p.energy} von ${SV_EMAX}">${Array.from({length:SV_EMAX},(_,k)=>`<i class="${k<p.energy?'on':''}"></i>`).join('')}</div>`:''}</div></div>`; }).join('');
@@ -1270,7 +1309,9 @@ function renderSV(){
 function svAgain(){
   if(!SV) return;
   SV=svNew(SV.players.map(p=>({name:p.name,av:p.av,tok:p.tok,ai:p.ai})),SV.round+1);
-  svDraft=null; svMode={abil:null,dir:'h'}; overlay(''); svChanged();
+  svDraft=null; svMode={abil:null,dir:'h'}; svPendViewer=null; clearTimeout(svCoverT);
+  if(mode==='local'){ const h=SV.players.findIndex(p=>!p.ai); svViewer=h>=0?h:0; }
+  overlay(''); svChanged();
 }
 function showSvRules(ret){
   overlay(`<div class="rules"><h2>Schiffe versenken</h2>
@@ -1286,12 +1327,306 @@ function showSvRules(ret){
   showSvRules.ret=ret;
 }
 
+/* ======================= MAU-MAU ======================= */
+const MM_SUITS=['♣','♠','♥','♦'], MM_SUITNAME=['Kreuz','Pik','Herz','Karo'];
+const MM_R32=['7','8','9','10','B','D','K','A'], MM_R52=['2','3','4','5','6','7','8','9','10','B','D','K','A'];
+const MM_EFF={none:'–',draw2:'Zwei ziehen',skip:'Aussetzen',reverse:'Richtungswechsel',wish:'Farbe wünschen',again:'Nochmal legen',all1:'Alle anderen ziehen 1'};
+const MM_TOGGLES=[['stack','Ziehkarten stapeln','Auf eine „Zwei ziehen“-Karte darf man eine weitere legen – der Nächste zieht dann 4, 6 …'],
+  ['wishAny','Wünscher passt auf jede Karte','Die Wunschkarte (z. B. Bube) darf man immer legen.'],
+  ['jackOnJack','Wünscher auf Wünscher','Wunschkarte darf auf eine Wunschkarte gelegt werden.'],
+  ['mau','„Mau“ sagen','Wer die vorletzte Karte legt, muss vorher „Mau“ tippen – sonst 2 Strafkarten.']];
+const MM_PRESETS=[
+  {id:'p-klassisch',name:'Klassisch',preset:true,hand:5,deck:32,eff:{'7':'draw2','8':'skip','B':'wish'},stack:true,jackOnJack:false,wishAny:true,mau:true},
+  {id:'p-einfach',name:'Einfach',preset:true,hand:5,deck:32,eff:{'7':'draw2','8':'skip','B':'wish'},stack:false,jackOnJack:false,wishAny:true,mau:false},
+  {id:'p-wild',name:'Wild',preset:true,hand:6,deck:32,eff:{'7':'draw2','8':'skip','9':'reverse','10':'all1','B':'wish','A':'again'},stack:true,jackOnJack:true,wishAny:true,mau:true}];
+function mmCleanRules(r){
+  r=r&&typeof r==='object'?r:{}; const eff={};
+  MM_R52.forEach(k=>{ const v=r.eff&&r.eff[k]; if(MM_EFF[v]&&v!=='none') eff[k]=v; });
+  const id=str(r.id,24);
+  return {id:/^[a-z0-9-]{3,24}$/.test(id)?id:('c-'+randHex(4)), name:str(r.name,24)||'Eigene Regeln', preset:!!r.preset, hand:int(r.hand,3,8,5),
+    deck:int(r.deck,32,52,32)===52?52:32, eff, stack:!!r.stack, jackOnJack:!!r.jackOnJack, wishAny:r.wishAny!==false, mau:!!r.mau};
+}
+let mmCustom=(()=>{ try{ const a=JSON.parse(lsGet('etappen-mmrules')); if(Array.isArray(a)) return a.slice(0,20).map(x=>mmCleanRules({...x,preset:false})); }catch(e){} return []; })();
+let mmSelId=lsGet('etappen-mmsel')||'p-klassisch';
+const mmAllRules=()=>[...MM_PRESETS,...mmCustom];
+const mmRules=()=>mmAllRules().find(r=>r.id===mmSelId)||MM_PRESETS[0];
+function mmSaveCustom(){ lsSet('etappen-mmrules',JSON.stringify(mmCustom)); lsSet('etappen-mmsel',mmSelId); }
+function mmSummary(r){
+  const ranks=r.deck===52?MM_R52:MM_R32, parts=ranks.filter(k=>r.eff[k]).map(k=>`${k}: ${MM_EFF[r.eff[k]]}`);
+  if(r.stack) parts.push('stapeln'); if(r.mau) parts.push('„Mau“ sagen');
+  parts.push(`${r.hand} Karten`); if(r.deck===52) parts.push('52er Blatt');
+  return parts.join(' · ');
+}
+
+let MM=null, MMV=null, mmViewer=null, mmPendViewer=null, mmCoverT=null, mmMauArmed=false, mmAiBusy=false, mmPrevCur=null, mmPick=null;
+const mmActive=()=>mode==='client'?!!MMV:!!MM;
+const mmEff=(R,c)=>(c&&R.eff[c.r])||'none';
+const mmIdx=(S,k)=>{ const n=S.players.length; return ((S.cur+S.dir*k)%n+n)%n; };
+function mmDeck(R,n){
+  const ranks=R.deck===52?MM_R52:MM_R32, copies=(n*R.hand+12>ranks.length*4)?2:1, d=[]; let id=0;
+  for(let k=0;k<copies;k++) for(let s=0;s<4;s++) for(const r of ranks) d.push({id:++id,s,r});
+  return shuffle(d);
+}
+function mmNew(cfg,R,prev){
+  const players=cfg.map((p,i)=>({name:p.name,av:cleanAv(p.av),tok:p.tok||null,ai:!!p.ai,hand:[],wins:prev&&prev.players[i]?prev.players[i].wins:0}));
+  const round=prev?prev.round+1:1;
+  const S={rules:mmCleanRules(R),players,deck:[],disc:[],cur:(round-1)%players.length,dir:1,pend:0,wish:null,drawn:null,phase:'play',winner:null,round,log:[],last:null};
+  S.deck=mmDeck(S.rules,players.length);
+  for(let k=0;k<S.rules.hand;k++) players.forEach(p=>p.hand.push(S.deck.pop()));
+  let top=S.deck.pop(), guard=0; while(mmEff(S.rules,top)!=='none'&&guard++<80){ S.deck.unshift(top); top=S.deck.pop(); }
+  S.disc.push(top);
+  S.last={by:null,type:'start',n:1,text:`Runde ${round}: ${players[S.cur].name} beginnt.`};
+  return S;
+}
+function mmDraw(S,p,k){
+  for(let i=0;i<k;i++){
+    if(!S.deck.length){ if(S.disc.length<=1) break; const top=S.disc.pop(); S.deck=shuffle(S.disc); S.disc=[top]; }
+    p.hand.push(S.deck.pop());
+  }
+}
+function mmCanPlay(S,c){
+  const R=S.rules, top=S.disc[S.disc.length-1], e=mmEff(R,c), te=mmEff(R,top);
+  if(S.pend>0) return R.stack&&e==='draw2';
+  if(e==='wish'){ if(te==='wish'&&!R.jackOnJack) return false; if(R.wishAny) return true; }
+  if(S.wish!=null) return c.s===S.wish;
+  return c.s===top.s||c.r===top.r;
+}
+function mmNext(S,steps){ S.cur=mmIdx(S,steps||1); S.drawn=null; }
+function mmApply(seat,a){
+  const S=MM; a=a&&typeof a==='object'?a:{};
+  if(!S||S.phase!=='play') return 'Die Runde ist vorbei.';
+  if(seat!==S.cur) return 'Du bist nicht dran.';
+  const p=S.players[seat], R=S.rules;
+  const say=t=>{ S.log.push(t); if(S.log.length>30) S.log.shift(); S.last={by:seat,type:a.type,n:(S.last?S.last.n:0)+1,text:t}; };
+  if(a.type==='play'){
+    const id=int(a.id,0,1e6,-1), c=p.hand.find(x=>x.id===id);
+    if(!c) return 'Diese Karte hast du nicht.';
+    if(S.drawn!=null&&c.id!==S.drawn) return 'Du darfst jetzt nur die gezogene Karte legen – oder „Weiter“ tippen.';
+    if(!mmCanPlay(S,c)) return S.pend>0?`Du musst ${S.pend} Karten ziehen${R.stack?' – oder eine Ziehkarte drauflegen':''}.`:(S.wish!=null?`Gewünscht ist ${MM_SUITNAME[S.wish]} ${MM_SUITS[S.wish]}.`:'Diese Karte passt nicht.');
+    p.hand=p.hand.filter(x=>x!==c); S.disc.push(c); S.wish=null; S.drawn=null;
+    if(S.disc.length>60) S.disc.splice(0,S.disc.length-60);
+    const e=mmEff(R,c); let t=`${p.name} legt ${MM_SUITS[c.s]}${c.r}`;
+    if(R.mau&&p.hand.length===1){ if(a.mau) t+=' – „Mau!“'; else { mmDraw(S,p,2); t+=' – vergisst „Mau“ und zieht 2 Strafkarten'; } }
+    if(!p.hand.length){ S.phase='over'; S.winner=seat; p.wins++; say(`${t}${R.mau?' – „Mau-Mau!“':''} ${p.name} gewinnt die Runde!`); return null; }
+    switch(e){
+      case 'draw2': S.pend+=2; mmNext(S); t+=` – ${S.players[S.cur].name} muss ${S.pend} ziehen!`; break;
+      case 'skip': t+=` – ${S.players[mmIdx(S,1)].name} setzt aus.`; mmNext(S,2); break;
+      case 'reverse': S.dir*=-1; t+=' – Richtungswechsel!'; mmNext(S); break;
+      case 'wish': { const w=int(a.wish,0,3,c.s); S.wish=w; t+=` und wünscht sich ${MM_SUITNAME[w]} ${MM_SUITS[w]}.`; mmNext(S); break; }
+      case 'again': t+=' und darf nochmal.'; break;
+      case 'all1': S.players.forEach((q,i)=>{ if(i!==seat) mmDraw(S,q,1); }); t+=' – alle anderen ziehen 1!'; mmNext(S); break;
+      default: if(!t.endsWith('“')) t+='.'; mmNext(S);
+    }
+    say(t); return null;
+  }
+  if(a.type==='draw'){
+    if(S.drawn!=null) return 'Du hast schon gezogen – lege die Karte oder tippe „Weiter“.';
+    if(S.pend>0){ const k=S.pend; mmDraw(S,p,k); S.pend=0; say(`${p.name} zieht ${k} Karten.`); mmNext(S); return null; }
+    const before=p.hand.length; mmDraw(S,p,1);
+    const c=p.hand[p.hand.length-1];
+    if(p.hand.length>before&&mmCanPlay(S,c)){ S.drawn=c.id; say(`${p.name} zieht eine Karte.`); }
+    else { say(`${p.name} zieht eine Karte – passt nicht.`); mmNext(S); }
+    return null;
+  }
+  if(a.type==='pass'){ if(S.drawn==null) return 'Zieh zuerst eine Karte.'; say(`${p.name} legt nichts.`); mmNext(S); return null; }
+  return 'Unbekannter Zug.';
+}
+function mmView(seat){
+  const S=MM;
+  return {rules:S.rules, phase:S.phase, round:S.round, cur:S.cur, dir:S.dir, pend:S.pend, wish:S.wish, winner:S.winner,
+    drawn:seat===S.cur?S.drawn:null, deckN:S.deck.length, disc:S.disc.slice(-3), last:S.last,
+    players:S.players.map(p=>({name:p.name,av:p.av,ai:p.ai,n:p.hand.length,wins:p.wins})),
+    hand:seat!=null&&S.players[seat]?S.players[seat].hand:[], you:seat};
+}
+function mmCleanCard(c){ if(!c||typeof c!=='object') return null; return {id:int(c.id,0,1e6,0),s:int(c.s,0,3,0),r:MM_R52.includes(c.r)?c.r:'7'}; }
+function sanitizeMmView(v){
+  if(!v||typeof v!=='object'||!Array.isArray(v.players)||v.players.length<2) return null;
+  const n=Math.min(6,v.players.length), L=v.last&&typeof v.last==='object'?v.last:null;
+  return {rules:mmCleanRules(v.rules), phase:v.phase==='over'?'over':'play', round:int(v.round,1,1e4,1), cur:int(v.cur,0,n-1,0), dir:v.dir===-1?-1:1,
+    pend:int(v.pend,0,60,0), wish:v.wish==null?null:int(v.wish,0,3,null), winner:v.winner==null?null:int(v.winner,0,n-1,null),
+    drawn:v.drawn==null?null:int(v.drawn,0,1e6,null), deckN:int(v.deckN,0,200,0),
+    disc:(Array.isArray(v.disc)?v.disc:[]).slice(-3).map(mmCleanCard).filter(Boolean),
+    last:L?{by:L.by==null?null:int(L.by,0,n-1,null),n:int(L.n,0,1e6,0),text:str(L.text,200)}:null,
+    players:v.players.slice(0,n).map(p=>{ p=p&&typeof p==='object'?p:{}; return {name:str(p.name,16)||'?',av:cleanAv(p.av),ai:!!p.ai,n:int(p.n,0,200,0),wins:int(p.wins,0,1e4,0)}; }),
+    hand:(Array.isArray(v.hand)?v.hand:[]).slice(0,120).map(mmCleanCard).filter(Boolean), you:v.you==null?null:int(v.you,0,n-1,null)};
+}
+function mmSeat(){
+  if(mode==='client') return MMV?MMV.you:null;
+  if(!MM) return null;
+  if(mode==='local') return mmViewer;
+  const i=MM.players.findIndex(p=>p.tok===myTok); return i<0?null:i;
+}
+const curMmView=()=>mode==='client'?MMV:(MM?mmView(mmSeat()):null);
+
+/* Computer */
+function mmAiMove(S,seat){
+  const p=S.players[seat], R=S.rules;
+  const play=p.hand.filter(c=>mmCanPlay(S,c)&&(S.drawn==null||c.id===S.drawn));
+  if(!play.length) return S.drawn!=null?{type:'pass'}:{type:'draw'};
+  const nextN=S.players[mmIdx(S,1)].hand.length;
+  const score=c=>{ const e=mmEff(R,c); let s=0; if(e==='wish') s-=5; if((e==='draw2'||e==='skip'||e==='all1')&&nextN<=2) s+=4; if(e==='again') s+=2; s+=p.hand.filter(x=>x.s===c.s).length*0.5; return s+Math.random(); };
+  const c=play.sort((a,b)=>score(b)-score(a))[0];
+  const counts=[0,0,0,0]; p.hand.forEach(x=>{ if(x!==c&&mmEff(R,x)!=='wish') counts[x.s]++; });
+  return {type:'play',id:c.id,wish:counts.indexOf(Math.max(...counts)),mau:true};
+}
+function maybeMmAI(){
+  if(mode==='client'||!MM||MM.phase!=='play'||mmAiBusy) return;
+  if(!MM.players[MM.cur].ai) return;
+  mmAiBusy=true; const my=MM;
+  setTimeout(()=>{ mmAiBusy=false; if(MM!==my||MM.phase!=='play'||!MM.players[MM.cur].ai) return;
+    const seat=MM.cur, err=mmApply(seat,mmAiMove(MM,seat));
+    if(err) mmApply(seat,MM.drawn!=null?{type:'pass'}:{type:'draw'});
+    mmChanged(); }, animOff?350:900);
+}
+/* Wer schaut aufs Gerät? (an einem Gerät mit mehreren Menschen) */
+function mmUpdateViewer(){
+  if(mode!=='local'||!MM||MM.phase!=='play') return;
+  const p=MM.players[MM.cur]; if(p.ai||MM.cur===mmViewer) return;
+  const humans=MM.players.filter(q=>!q.ai).length;
+  if(humans<=1||mmViewer==null){ mmViewer=MM.cur; return; }
+  if(mmPendViewer===MM.cur) return;
+  mmPendViewer=MM.cur; clearTimeout(mmCoverT);
+  mmCoverT=setTimeout(()=>{ if(MM&&mmPendViewer!=null&&!ovKey) showMmCover(); }, animOff?100:700);
+}
+function showMmCover(){
+  const p=MM.players[mmPendViewer]; if(!p) return;
+  overlay(`<div class="center-av">${avatarSVG(p.av,84,'av av-xl')}</div><h2>Weitergeben an ${esc(p.name)}</h2><p>Die anderen bitte wegschauen.</p><div class="row"><button class="btn primary" id="mmUncover">Ich bin ${esc(p.name)} – Karten zeigen</button></div>`,'mmcover');
+}
+function mmChanged(){ if(mode==='local') mmUpdateViewer(); if(mode==='host'){ hostBroadcast(); hostSave(); } render(); maybeMmAI(); }
+function mmAct(a){
+  if(mode==='client'){ if(!hostReachable()){ toast('Keine Verbindung zum Gastgeber – ich versuche es weiter …'); return; } clientAct(a); return; }
+  const err=mmApply(mmSeat(),a); if(err){ toast(err); return; }
+  mmChanged();
+}
+function mmStartLocal(cfg){
+  mode='local'; G=null; SV=null; SVV=null; MM=null; MMV=null; MMV=null; mmPendViewer=null; mmMauArmed=false;
+  MM=mmNew(cfg,mmRules());
+  const h=MM.players.map((p,i)=>p.ai?-1:i).filter(i=>i>=0); mmViewer=h.length?h[0]:null;
+  overlay(''); mmChanged();
+}
+function mmNextRound(){
+  if(!MM) return;
+  MM=mmNew(MM.players.map(p=>({name:p.name,av:p.av,tok:p.tok,ai:p.ai})),MM.rules,MM);
+  mmPendViewer=null; mmMauArmed=false; overlay(''); mmChanged();
+}
+
+/* Anzeige */
+function mmCardHTML(c,cls='',attrs=''){
+  if(!c) return `<div class="card empty ${cls}" ${attrs}></div>`;
+  const s=int(c.s,0,3,0), r=MM_R52.includes(c.r)?c.r:'?';
+  return `<button class="card mm s${s} ${cls}" ${attrs} aria-label="${MM_SUITNAME[s]} ${r}"><span class="tl">${r}</span><span class="n">${r}</span><span class="s">${MM_SUITS[s]}</span></button>`;
+}
+const mmSortKey=c=>c.s*20+MM_R52.indexOf(c.r);
+function renderMM(){
+  const V=curMmView(); if(!V) return;
+  const me=mode==='client'?V.you:mmSeat(), covered=mode==='local'&&mmPendViewer!=null;
+  const mine=V.phase==='play'&&V.cur===me&&me!=null&&!covered;
+  const R=V.rules, top=V.disc[V.disc.length-1];
+  $('roundInfo').textContent=`Mau-Mau · Runde ${V.round}`;
+  $('mmPlayers').innerHTML=V.players.map((p,i)=>`<div class="pl${V.phase==='play'&&V.cur===i?' cur':''}"><div class="pl-top"><div class="pl-who">${avatarSVG(p.av,40)}<div class="pl-name">${esc(p.name)}${p.ai?' <span class="pl-meta">· Computer</span>':''}${i===me&&mode!=='local'?' <span class="pl-meta">· du</span>':''}</div></div><div class="pl-meta">${p.n} Karte${p.n===1?'':'n'} · ${p.wins} Sieg${p.wins===1?'':'e'}</div></div>${p.n===1&&V.phase==='play'?'<div class="mau-badge">Mau!</div>':''}</div>`).join('');
+  $('mmDeck').innerHTML=`<button class="card big back${mine&&V.drawn==null?' can':''}" id="mmDeckBtn" aria-label="Karte ziehen"></button>`;
+  $('mmDeckN').textContent=`Stapel · ${V.deckN}`;
+  $('mmDisc').innerHTML=mmCardHTML(top,'big land','id="mmTop" tabindex="-1"');
+  $('mmInfo').innerHTML=V.pend>0?`<span class="mm-tag warn">+${V.pend} ziehen!</span>`:V.wish!=null?`<span class="mm-tag s${V.wish}">Wunsch: ${MM_SUITS[V.wish]} ${MM_SUITNAME[V.wish]}</span>`:`<span class="mm-tag">${V.dir===1?'↻ im Uhrzeigersinn':'↺ gegen den Uhrzeigersinn'}</span>`;
+  let msg='',sub='';
+  if(V.phase==='over') msg=`${V.players[V.winner].name} gewinnt die Runde!`;
+  else if(!mine){ msg=`${V.players[V.cur].name} ist dran …`; if(me==null&&mode!=='local') sub='Du schaust zu.'; }
+  else if(V.pend>0){ msg=`Du musst ${V.pend} Karten ziehen.`; sub=R.stack?'Oder lege selbst eine Ziehkarte drauf.':'Tippe auf den Stapel.'; }
+  else if(V.drawn!=null){ msg='Gezogene Karte legen oder „Weiter“.'; }
+  else { msg='Du bist dran: Karte legen oder ziehen.'; sub=V.wish!=null?`Gewünscht ist ${MM_SUITNAME[V.wish]} ${MM_SUITS[V.wish]}.`:''; }
+  if(mode==='client'&&!hostReachable()) sub='Verbindung zum Gastgeber unterbrochen – ich versuche es automatisch weiter …';
+  $('mmMsg').textContent=msg; $('mmSub').textContent=sub;
+  $('mmLog').innerHTML=V.last&&V.last.text?`<div class="sv-last">${esc(V.last.text)}</div>`:'';
+  // Hand
+  const meP=me!=null?V.players[me]:null;
+  if(!meP||covered){ $('handTitle').textContent=covered?'Karten verdeckt':'Du spielst nicht mit.'; $('req').innerHTML=''; $('hand').innerHTML=''; $('actions').innerHTML=''; }
+  else {
+    $('handTitle').innerHTML=`${avatarSVG(meP.av,28)}<span class="ht-name">${esc(meP.name)}</span> <span>· Regeln: ${esc(R.name)}</span>`;
+    const hand=[...V.hand].sort((a,b)=>mmSortKey(a)-mmSortKey(b));
+    const showMau=R.mau&&mine&&V.hand.length===2;
+    $('req').innerHTML=`<span class="chip">${esc(mmSummary(R))}</span>`;
+    $('hand').innerHTML=hand.map(c=>{ const ok=mine&&mmCanPlay(V,c)&&(V.drawn==null||c.id===V.drawn); return mmCardHTML(c,(ok?'can':(mine?'dim':''))+(c.id===V.drawn?' sel':''),`data-mmc="${c.id}"`); }).join('');
+    const a=[];
+    if(mine){
+      if(showMau) a.push(`<button class="btn mau-btn${mmMauArmed?' on':''}" id="mmMau">${mmMauArmed?'„Mau!“ gesagt ✓':'„Mau“ sagen!'}</button>`);
+      if(V.drawn==null) a.push(`<button class="btn primary" id="mmDraw">${V.pend>0?`${V.pend} Karten ziehen`:'Karte ziehen'}</button>`);
+      else a.push(`<button class="btn primary" id="mmPass">Weiter</button>`);
+    }
+    $('actions').innerHTML=a.join('');
+  }
+  if(mine&&mmPrevCur!==me&&meP) showTurnBanner(meP.av);
+  mmPrevCur=V.phase==='play'?(covered?null:V.cur):null;
+  // Rundenende
+  if(V.phase==='over'){
+    const k='mmend'+V.round;
+    if(ovKey!==k&&!['rules','menu','settings','privacy','online','avatar','mmrules','mmedit','mmhow'].includes(ovKey)){
+      const w=V.players[V.winner], canGo=mode!=='client';
+      const rows=[...V.players].map((p,i)=>({p,i})).sort((a,b)=>b.p.wins-a.p.wins).map(({p})=>`<tr><td><span class="who">${avatarSVG(p.av,26)}${esc(p.name)}</span></td><td>${p.wins}</td><td>${p.n}</td></tr>`).join('');
+      setTimeout(()=>{ if(mmActive()&&curMmView().phase==='over'&&ovKey!==k) overlay(`<div class="center-av winner">${avatarSVG(w.av,110,'av av-xl')}</div><h2>Mau-Mau! ${esc(w.name)} gewinnt!</h2><table><tr><th>Spieler</th><th>Siege</th><th>Karten übrig</th></tr>${rows}</table>${canGo?'':`<p class="note">Warte, bis ${esc((CLIENT&&CLIENT.hostName)||'der Gastgeber')} die nächste Runde startet.</p>`}<div class="row mt">${canGo?'<button class="btn primary" id="mmNextRound">Nächste Runde</button>':''}<button class="btn" id="toMenu">Zum Menü</button></div>`,k); }, animOff?0:700);
+    }
+  } else if(ovKey.startsWith('mmend')) overlay('');
+}
+function showMmWish(card){
+  mmPick=card;
+  overlay(`<h2>Welche Farbe wünschst du dir?</h2><div class="mm-wish">${MM_SUITS.map((s,i)=>`<button class="mm-wishbtn s${i}" data-mmwish="${i}"><span>${s}</span><small>${MM_SUITNAME[i]}</small></button>`).join('')}</div><div class="row mt"><button class="btn" id="mmWishCancel">Abbrechen</button></div>`,'mmwish');
+}
+
+/* Regelwerke: Auswahl & Editor */
+let mmRulesRet='menu', mmEdit=null;
+function showMmRulesPage(ret){
+  if(ret) mmRulesRet=ret;
+  overlay(`<div class="page"><div class="page-top"><button class="btn" id="mmRulesBack">‹ Zurück</button><h2>Mau-Mau-Regeln</h2></div>
+    <p class="note">Wähle ein Regelwerk oder erstelle dein eigenes. Das ausgewählte gilt für das nächste Spiel.</p>
+    <div class="mm-sets">${mmAllRules().map(r=>`<div class="mm-set${r.id===mmSelId?' on':''}">
+      <button class="mm-set-main" data-mmsel="${esc(r.id)}"><b>${r.id===mmSelId?'✓ ':''}${esc(r.name)}${r.preset?' <span class="pl-meta">· Vorlage</span>':''}</b><small>${esc(mmSummary(r))}</small></button>
+      <div class="row">${r.preset?`<button class="btn sm" data-mmcopy="${esc(r.id)}">Als Vorlage für eigene Regeln</button>`:`<button class="btn sm" data-mmedit="${esc(r.id)}">Bearbeiten</button><button class="btn sm" data-mmdel="${esc(r.id)}">Löschen</button>`}</div></div>`).join('')}</div>
+    <div class="row mt"><button class="btn primary" id="mmNewRules">Neues Regelwerk</button><button class="btn" id="mmHowTo">So wird gespielt</button></div></div>`,'mmrules','full');
+}
+function showMmEditor(){
+  const r=mmEdit, ranks=r.deck===52?MM_R52:MM_R32;
+  overlay(`<div class="page"><div class="page-top"><button class="btn" id="mmEditCancel">‹ Abbrechen</button><h2>Regelwerk</h2></div>
+    <div class="row"><label class="note" for="mmName">Name</label><input type="text" id="mmName" maxlength="24" value="${esc(r.name)}"></div>
+    <div class="row"><label class="note" for="mmHand">Startkarten</label><select id="mmHand">${[3,4,5,6,7,8].map(n=>`<option value="${n}" ${r.hand===n?'selected':''}>${n}</option>`).join('')}</select>
+      <label class="note" for="mmDeckSel">Kartenspiel</label><select id="mmDeckSel"><option value="32" ${r.deck===32?'selected':''}>32 Karten (7 bis Ass)</option><option value="52" ${r.deck===52?'selected':''}>52 Karten (2 bis Ass)</option></select></div>
+    <h3>Was bewirkt welche Karte?</h3>
+    <div class="mm-effs">${ranks.map(k=>`<label class="mm-eff"><span class="mm-rank">${k}</span><select id="mmEff-${k}">${Object.entries(MM_EFF).map(([key,lab])=>`<option value="${key}" ${(r.eff[k]||'none')===key?'selected':''}>${lab}</option>`).join('')}</select></label>`).join('')}</div>
+    <p class="note">B = Bube, D = Dame, K = König, A = Ass.</p>
+    <h3>Weitere Regeln</h3>
+    <div class="mm-togs">${MM_TOGGLES.map(([k,lab,desc])=>`<div class="mm-tog"><div><b>${lab}</b><small>${desc}</small></div><div class="seg"><button data-mmtog="${k},1" class="${r[k]?'on':''}">An</button><button data-mmtog="${k},0" class="${r[k]?'':'on'}">Aus</button></div></div>`).join('')}</div>
+    <div class="row mt"><button class="btn primary" id="mmEditSave">Speichern & auswählen</button></div></div>`,'mmedit','full');
+}
+function mmReadForm(){
+  if(!mmEdit) return;
+  const nm=$('mmName'); if(nm) mmEdit.name=str(nm.value,24)||'Eigene Regeln';
+  const h=$('mmHand'); if(h) mmEdit.hand=int(h.value,3,8,5);
+  const d=$('mmDeckSel'); if(d) mmEdit.deck=d.value==='52'?52:32;
+  MM_R52.forEach(k=>{ const s=$('mmEff-'+k); if(s){ if(s.value!=='none'&&MM_EFF[s.value]) mmEdit.eff[k]=s.value; else delete mmEdit.eff[k]; } });
+}
+function showMmHowTo(){
+  const R=mmRules();
+  overlay(`<div class="rules"><h2>Mau-Mau</h2>
+    <ol>
+      <li><b>Ziel:</b> Als Erster alle Karten loswerden.</li>
+      <li><b>Legen:</b> Auf die oberste Karte darfst du eine Karte mit <b>gleicher Farbe</b> oder <b>gleichem Wert</b> legen.</li>
+      <li><b>Ziehen:</b> Kannst oder willst du nicht legen, ziehst du eine Karte. Passt sie, darfst du sie sofort legen – sonst ist der Nächste dran.</li>
+      <li><b>Sonderkarten</b> im Regelwerk „${esc(R.name)}“: ${esc(mmSummary(R))}.</li>
+      ${R.mau?'<li><b>„Mau“:</b> Bevor du deine vorletzte Karte legst, tippe „Mau sagen“. Vergisst du es, ziehst du 2 Strafkarten.</li>':''}
+    </ol>
+    <p class="note">Unter „Regeln“ kannst du andere Regelwerke wählen oder eigene erstellen.</p>
+    <div class="row mt"><button class="btn primary" id="mmHowBack">Verstanden</button></div></div>`,'mmhow',mmRulesRet==='menu'?'full':'');
+}
+
 function render(){
   const before=captureRects(), prev=prevSnap;
   const chip=$('netChip');
   if(mode==='host'&&HOST){ const ok=netOnline(); chip.hidden=false; chip.className='netchip'+(ok?'':' bad'); chip.textContent=ok?`Gastgeber · ${fmtCode(HOST.code)} · ${onlineCount()+1} online`:'Kein Internet – verbinde neu …'; }
   else if(mode==='client'&&CLIENT){ const ok=hostReachable(); chip.hidden=false; chip.className='netchip'+(ok?'':' bad'); chip.textContent=ok?'Online · '+fmtCode(CLIENT.code):(netOnline()?'Suche Gastgeber …':'Kein Internet – verbinde neu …'); }
   else chip.hidden=true;
+  if(mmActive()){
+    $('players').innerHTML=''; $('center').hidden=true; $('board').hidden=true; $('sv').hidden=true; $('mm').hidden=false; $('dock').hidden=false;
+    prevSnap=null; renderMM(); measureDock(); return;
+  }
+  $('mm').hidden=true; mmPrevCur=null;
   if(svActive()){
     $('players').innerHTML=''; $('center').hidden=true; $('dock').hidden=true; $('board').hidden=true; $('sv').hidden=false; measureDock();
     prevSnap=null; renderSV(); return;
@@ -1453,7 +1788,13 @@ function showMenu(){
   const fan=[{k:'n',n:1,c:0},{k:'n',n:7,c:1},{k:'j'},{k:'n',n:12,c:3},{k:'n',n:5,c:2}];
   const mini=[{k:'n',n:3,c:0},{k:'j'},{k:'n',n:9,c:1}];
   const boat=`<svg class="boat" viewBox="0 0 120 70" aria-hidden="true"><path d="M8 44 L112 44 L98 62 L22 62 Z" fill="#8a96a3" stroke="#1d1b26" stroke-width="3" stroke-linejoin="round"/><rect x="38" y="30" width="34" height="14" rx="3" fill="#ced4da" stroke="#1d1b26" stroke-width="3"/><rect x="50" y="16" width="10" height="14" fill="#ff6b6b" stroke="#1d1b26" stroke-width="3"/><path d="M0 66 Q15 60 30 66 T60 66 T90 66 T120 66" fill="none" stroke="#e8f4ff" stroke-width="3" stroke-linecap="round"/></svg>`;
-  const playing=G||svActive();
+  const playing=G||svActive()||mmActive();
+  const mmFan=[{s:2,r:'B'},{s:1,r:'7'},{s:3,r:'A'}];
+  const tile=(game,cls,art,title,sub)=>`<div class="tile ${cls}">
+        <div class="tile-art" aria-hidden="true">${art}</div>
+        <div class="tile-body"><b>${title}</b><small>${sub}</small>
+          <div class="tile-btns"><button class="btn primary" data-play="${game}">An einem Gerät</button><button class="btn" data-online="${game}">Online-Raum</button><button class="btn" data-rules="${game}">Regeln</button></div></div>
+      </div>`;
   overlay(`<div class="home">
     <div class="home-hero">
       <div class="fan" aria-hidden="true">${fan.map((c,i)=>decoCard(c,'fan-'+i)).join('')}</div>
@@ -1466,16 +1807,9 @@ function showMenu(){
     </div>
     ${playing?`<button class="hbtn go" id="closeOv"><b>Weiterspielen</b><small>Zurück zum laufenden Spiel</small></button>`:''}
     <div class="tiles">
-      <div class="tile tile-cards">
-        <div class="tile-art" aria-hidden="true">${mini.map((c,i)=>decoCard(c,'tf-'+i)).join('')}</div>
-        <div class="tile-body"><b>Etappen-Rommé</b><small>10 Etappen · 2–6 Spieler · auch gegen Computer</small>
-          <div class="tile-btns"><button class="btn primary" id="localSetup">Spielen</button><button class="btn" id="hostRoom">Online-Raum</button><button class="btn" id="showRules2">Regeln</button></div></div>
-      </div>
-      <div class="tile tile-sea">
-        <div class="tile-art" aria-hidden="true">${boat}</div>
-        <div class="tile-body"><b>Schiffe versenken</b><small>Mit Radar, Torpedo, Bombe & Salve · 2 Spieler</small>
-          <div class="tile-btns"><button class="btn primary" id="svVsCpu">Gegen Computer</button><button class="btn" id="svOnline">Online-Raum</button><button class="btn" id="svRulesBtn">Regeln</button></div></div>
-      </div>
+      ${tile('etappen','tile-cards',mini.map((c,i)=>decoCard(c,'tf-'+i)).join(''),'Etappen-Rommé','10 Etappen sammeln · 2–6 Spieler')}
+      ${tile('maumau','tile-mm',mmFan.map((c,i)=>mmCardHTML(c,'tf-'+i).replace(/^<button/,'<div').replace(/<\/button>$/,'</div>')).join(''),'Mau-Mau',`Eigene Regeln · 2–6 Spieler`)}
+      ${tile('schiffe','tile-sea',boat,'Schiffe versenken','Mit Spezialangriffen · 2 Spieler')}
     </div>
     <div class="home-btns">
       <button class="hbtn" id="goOnline"><b>Mit Code beitreten</b><small>Ein Freund hat einen Raum erstellt?</small></button>
@@ -1483,7 +1817,7 @@ function showMenu(){
     </div>
     <div class="home-foot">
       <button class="hlink" id="showPrivacy">Datenschutz</button>
-      ${G||svActive()?'<button class="hlink" id="toMenu">Spiel beenden</button>':''}
+      ${playing?'<button class="hlink" id="toMenu">Spiel beenden</button>':''}
       ${installBlock()}
       <span class="hnote">Version ${APP_VERSION}</span>
     </div>
@@ -1503,7 +1837,7 @@ function showOnline(){
     </div>
     <div class="choice">
       <div><h3>Neues Spiel</h3><p class="note">Du wirst Gastgeber und bekommst einen Code für deine Freunde. Dein Gerät muss während des Spiels online bleiben.</p>
-        <div class="row"><button class="btn primary" id="hostRoom">Etappen-Rommé-Raum</button><button class="btn primary" id="hostRoomSv">Schiffe-versenken-Raum</button></div>
+        <div class="row"><button class="btn primary" id="hostRoom">Etappen-Rommé-Raum</button><button class="btn primary" id="hostRoomMm">Mau-Mau-Raum</button><button class="btn primary" id="hostRoomSv">Schiffe-versenken-Raum</button></div>
         ${sh?`<div class="row"><button class="btn" id="resumeHost">Raum ${esc(fmtCode(sh.code))} fortsetzen (${GAME_NAME[sh.game==='schiffe'?'schiffe':'etappen']})</button></div>`:''}</div>
       <div><h3>Mitspielen</h3><p class="note">Gib den Code ein, den du bekommen hast.</p>
         <div class="row"><input type="text" id="codeIn" maxlength="${CODE_LEN+1}" placeholder="ABCD-2345" value="${esc(last?fmtCode(last):'')}" aria-label="Raum-Code" autocapitalize="characters" autocomplete="off" spellcheck="false" class="codein"><button class="btn primary" id="joinRoom">Beitreten</button></div></div>
@@ -1541,6 +1875,7 @@ function showLobby(){
     <div class="row"><button class="btn primary" id="shareInvite">Einladung teilen</button><button class="btn" id="copyCode">Code kopieren</button></div>
     <h3>Spieler (${seats.length}/${max})</h3><ul class="seats">${list}</ul>
     ${sv&&seats.length<2?'<p class="note">Schiffe versenken spielt man zu zweit – warte auf deinen Gegner.</p>':''}
+    ${game==='maumau'?(()=>{ const R=isHost?HOST.rules:CLIENT.lobby.rules; return R?`<div class="row"><span>Regeln: <b>${esc(R.name)}</b></span>${isHost?'<button class="btn sm" id="mmLobbyRules">Ändern</button>':''}</div><p class="note">${esc(mmSummary(R))}</p>`:''; })():''}
     ${isHost?'<p class="note">Unbekannte Namen kannst du mit „Entfernen“ wieder hinauswerfen.</p>':''}
     <div class="row mt">
       ${isHost?`<button class="btn primary" id="startOnline" ${(sv?seats.length===2:seats.length>=2)?'':'disabled'}>Spiel starten</button>${sv?'':`<button class="btn" id="addBot" ${seats.length<6?'':'disabled'}>Computer hinzufügen</button>`}`:'<span class="note">Warte, bis der Gastgeber das Spiel startet …</span>'}
@@ -1575,13 +1910,31 @@ let setupCfg=null;
 try{setupCfg=JSON.parse(lsGet('etappen-setup'));}catch(e){}
 if(!Array.isArray(setupCfg)||!setupCfg.length||setupCfg.length>6) setupCfg=[{name:'Spieler 1',ai:false},{name:'Spieler 2',ai:false},{name:'Spieler 3',ai:false},{name:'Spieler 4',ai:false}];
 setupCfg=setupCfg.map((p,i)=>({name:str(p&&p.name,16)||('Spieler '+(i+1)),ai:!!(p&&p.ai),av:p&&p.av?cleanAv(p.av):(i===0?{...myAv}:randomAv())}));
-function showSetup(){
-  const rows=setupCfg.map((p,i)=>`<div class="row"><button class="av-btn sm" data-avr="${i}" aria-label="Andere Figur für Spieler ${i+1}">${avatarSVG(p.av,40)}</button><input type="text" id="pname${i}" value="${esc(p.name)}" maxlength="16" aria-label="Name Spieler ${i+1}"><div class="seg"><button data-type="${i},0" class="${p.ai?'':'on'}">Mensch</button><button data-type="${i},1" class="${p.ai?'on':''}">Computer</button></div></div>`).join('');
-  overlay(`<h2>Spiel an einem Gerät</h2><p>2 bis 6 Spieler. Menschen spielen abwechselnd an diesem Gerät – vor jedem Zug wird die Hand verdeckt. Tippe auf eine Figur, um eine andere zu würfeln.</p>
-    <div class="row"><span>Spieler:</span><div class="seg">${[2,3,4,5,6].map(n=>`<button data-count="${n}" class="${setupCfg.length===n?'on':''}">${n}</button>`).join('')}</div></div>
-    ${rows}<div class="row mt"><button class="btn primary" id="startLocal">Spiel starten</button><button class="btn" id="backMenu">Zurück</button></div>`,'setup');
+/* Einrichtung für alle Spiele (an einem Gerät) */
+const SETUP_KEY={etappen:'etappen-setup',schiffe:'etappen-setup-sv',maumau:'etappen-setup-mm'};
+function loadSetup(g,def){
+  let c=null; try{ c=JSON.parse(lsGet(SETUP_KEY[g])); }catch(e){}
+  if(!Array.isArray(c)||!c.length||c.length>6) c=def;
+  return c.map((p,i)=>({name:str(p&&p.name,16)||('Spieler '+(i+1)),ai:!!(p&&p.ai),av:p&&p.av?cleanAv(p.av):(i===0?{...myAv}:randomAv())}));
 }
-function readSetupNames(){setupCfg.forEach((p,i)=>{const el=$('pname'+i); if(el) p.name=str(el.value,16)||('Spieler '+(i+1));});}
+const setupCfgs={etappen:setupCfg,
+  schiffe:loadSetup('schiffe',[{name:myName||'Spieler 1',ai:false},{name:'Computer',ai:true}]).slice(0,2),
+  maumau:loadSetup('maumau',[{name:myName||'Spieler 1',ai:false},{name:'Computer 1',ai:true},{name:'Computer 2',ai:true}])};
+if(setupCfgs.schiffe.length<2) setupCfgs.schiffe.push({name:'Computer',ai:true,av:randomAv()});
+let setupGame='etappen';
+const SC=()=>setupCfgs[setupGame];
+function showSetup(game){
+  if(game) setupGame=game;
+  const cfg=SC(), fixed=setupGame==='schiffe';
+  const title={etappen:'Etappen-Rommé',schiffe:'Schiffe versenken',maumau:'Mau-Mau'}[setupGame];
+  const rows=cfg.map((p,i)=>`<div class="row"><button class="av-btn sm" data-avr="${i}" aria-label="Andere Figur für Spieler ${i+1}">${avatarSVG(p.av,40)}</button><input type="text" id="pname${i}" value="${esc(p.name)}" maxlength="16" aria-label="Name Spieler ${i+1}"><div class="seg"><button data-type="${i},0" class="${p.ai?'':'on'}">Mensch</button><button data-type="${i},1" class="${p.ai?'on':''}">Computer</button></div></div>`).join('');
+  const extra=setupGame==='maumau'?`<div class="row mt"><span>Regeln: <b>${esc(mmRules().name)}</b></span><button class="btn sm" id="mmRulesFromSetup">Ändern</button></div><p class="note">${esc(mmSummary(mmRules()))}</p>`:'';
+  overlay(`<div class="page"><div class="page-top"><button class="btn" id="backMenu">‹ Zurück</button><h2>${title}</h2></div>
+    <p class="note">${fixed?'Zwei Spieler: gegen den Computer oder zu zweit an einem Gerät.':'2 bis 6 Spieler.'} Menschen spielen abwechselnd an diesem Gerät – vor jedem Zug wird verdeckt. Tippe auf eine Figur, um eine andere zu würfeln.</p>
+    ${fixed?'':`<div class="row"><span>Spieler:</span><div class="seg">${[2,3,4,5,6].map(n=>`<button data-count="${n}" class="${cfg.length===n?'on':''}">${n}</button>`).join('')}</div></div>`}
+    ${rows}${extra}<div class="row mt"><button class="btn primary" id="startLocal">Spiel starten</button></div></div>`,'setup','full');
+}
+function readSetupNames(){SC().forEach((p,i)=>{const el=$('pname'+i); if(el) p.name=str(el.value,16)||('Spieler '+(i+1));});}
 let rulesReturn=null;
 function showRules(){
   overlay(`<div class="rules"><h2>So wird gespielt</h2>
@@ -1654,14 +2007,53 @@ document.addEventListener('click',async e=>{
   if(id==='animOn'||id==='animOffBtn'){ animOff=id==='animOffBtn'; lsSet('etappen-anim',animOff?'off':'on'); applyTheme(); showSettings(); return; }
   if(t.dataset.av){ const [k,d]=t.dataset.av.split(','); if(AV_PARTS[k]){ const n=AV_PARTS[k]; avDraft[k]=(avDraft[k]+Number(d)+n)%n; showAvatarEditor(); } return; }
   if(id==='avRandom'){ avDraft=randomAv(); showAvatarEditor(); return; }
-  if(id==='avSave'){ myAv=cleanAv(avDraft); saveAv(); if(setupCfg[0]&&!setupCfg[0].ai) setupCfg[0].av={...myAv}; avatarChanged(); toast('Charakter gespeichert.'); closeAvatarEditor(); return; }
+  if(id==='avSave'){ myAv=cleanAv(avDraft); saveAv(); Object.values(setupCfgs).forEach(c=>{ if(c[0]&&!c[0].ai) c[0].av={...myAv}; }); avatarChanged(); toast('Charakter gespeichert.'); closeAvatarEditor(); return; }
   if(id==='avCancel'){ closeAvatarEditor(); return; }
-  if(t.dataset.avr!=null){ readSetupNames(); const i=int(t.dataset.avr,0,5,0); if(setupCfg[i]) setupCfg[i].av=randomAv(); showSetup(); return; }
+  if(t.dataset.avr!=null){ readSetupNames(); const i=int(t.dataset.avr,0,5,0); if(SC()[i]) SC()[i].av=randomAv(); showSetup(); return; }
+  /* Startbildschirm-Kacheln */
+  if(t.dataset.play){ readName(); showSetup(t.dataset.play); return; }
+  if(t.dataset.online){ hostGame(null,t.dataset.online); return; }
+  if(t.dataset.rules){ readName(); const g=t.dataset.rules; if(g==='schiffe') showSvRules('menu'); else if(g==='maumau') showMmRulesPage('menu'); else { rulesReturn='menu'; showRules(); } return; }
+  if(id==='hostRoomMm'){ hostGame(null,'maumau'); return; }
+  /* Schiffe: verdeckt weitergeben */
+  if(id==='svUncover'){ if(svPendViewer!=null){ svViewer=svPendViewer; svPendViewer=null; } overlay(''); render(); return; }
+  /* Mau-Mau */
+  if(id==='mmUncover'){ if(mmPendViewer!=null){ mmViewer=mmPendViewer; mmPendViewer=null; } overlay(''); render(); return; }
+  if(id==='mmDeckBtn'||id==='mmDraw'){ const V=curMmView(); if(V&&V.phase==='play'&&V.cur===(mode==='client'?V.you:mmSeat())&&V.drawn==null&&!(mode==='local'&&mmPendViewer!=null)) mmAct({type:'draw'}); return; }
+  if(id==='mmPass'){ mmAct({type:'pass'}); return; }
+  if(id==='mmMau'){ mmMauArmed=!mmMauArmed; render(); return; }
+  if(id==='mmNextRound'){ if(mode!=='client') mmNextRound(); return; }
+  if(t.dataset.mmc&&mmActive()){
+    const V=curMmView(), me=mode==='client'?V.you:mmSeat();
+    if(!V||V.phase!=='play'||V.cur!==me||(mode==='local'&&mmPendViewer!=null)) return;
+    const c=V.hand.find(x=>x.id===+t.dataset.mmc); if(!c) return;
+    if(V.drawn!=null&&c.id!==V.drawn){ toast('Du darfst jetzt nur die gezogene Karte legen – oder „Weiter“.'); return; }
+    if(!mmCanPlay(V,c)){ toast(V.pend>0?`Du musst ${V.pend} Karten ziehen${V.rules.stack?' – oder eine Ziehkarte legen':''}.`:V.wish!=null?`Gewünscht ist ${MM_SUITNAME[V.wish]} ${MM_SUITS[V.wish]}.`:'Diese Karte passt nicht.'); return; }
+    if(mmEff(V.rules,c)==='wish'){ showMmWish(c); return; }
+    const mau=mmMauArmed; mmMauArmed=false; mmAct({type:'play',id:c.id,mau}); return;
+  }
+  if(t.dataset.mmwish!=null&&mmPick){ const c=mmPick; mmPick=null; overlay(''); const mau=mmMauArmed; mmMauArmed=false; mmAct({type:'play',id:c.id,wish:int(t.dataset.mmwish,0,3,0),mau}); return; }
+  if(id==='mmWishCancel'){ mmPick=null; overlay(''); render(); return; }
+  /* Mau-Mau-Regeln */
+  if(id==='mmRulesFromSetup'){ readSetupNames(); showMmRulesPage('setup'); return; }
+  if(id==='mmLobbyRules'){ showMmRulesPage('lobby'); return; }
+  if(id==='mmRulesBack'){ if(mmRulesRet==='setup') showSetup('maumau'); else if(mmRulesRet==='lobby') showLobby(); else showMenu(); return; }
+  if(t.dataset.mmsel){ if(mmAllRules().some(r=>r.id===t.dataset.mmsel)){ mmSelId=t.dataset.mmsel; mmSaveCustom(); if(mode==='host'&&HOST&&HOST.game==='maumau'&&HOST.status==='lobby'){ HOST.rules=mmRules(); hostSave(); hostBroadcast(); } } showMmRulesPage(); return; }
+  if(t.dataset.mmcopy||id==='mmNewRules'){ const base=mmAllRules().find(r=>r.id===(t.dataset.mmcopy||mmSelId))||MM_PRESETS[0]; mmEdit=JSON.parse(JSON.stringify({...base,id:'c-'+randHex(4),name:'Meine Regeln',preset:false})); mmEdit.isNew=true; showMmEditor(); return; }
+  if(t.dataset.mmedit){ const r=mmCustom.find(x=>x.id===t.dataset.mmedit); if(r){ mmEdit=JSON.parse(JSON.stringify(r)); showMmEditor(); } return; }
+  if(t.dataset.mmdel){ if(t.dataset.sure!=='1'){ t.dataset.sure='1'; t.textContent='Wirklich löschen?'; return; } mmCustom=mmCustom.filter(x=>x.id!==t.dataset.mmdel); if(!mmAllRules().some(r=>r.id===mmSelId)) mmSelId='p-klassisch'; mmSaveCustom(); showMmRulesPage(); return; }
+  if(t.dataset.mmtog&&mmEdit){ mmReadForm(); const [k,v]=t.dataset.mmtog.split(','); if(MM_TOGGLES.some(x=>x[0]===k)) mmEdit[k]=v==='1'; showMmEditor(); return; }
+  if(id==='mmEditCancel'){ mmEdit=null; showMmRulesPage(); return; }
+  if(id==='mmEditSave'&&mmEdit){ mmReadForm(); const r=mmCleanRules({...mmEdit,preset:false}); const i=mmCustom.findIndex(x=>x.id===r.id); if(i>=0) mmCustom[i]=r; else mmCustom.push(r); mmSelId=r.id; mmSaveCustom(); mmEdit=null;
+    if(mode==='host'&&HOST&&HOST.game==='maumau'&&HOST.status==='lobby'){ HOST.rules=mmRules(); hostSave(); hostBroadcast(); }
+    toast('Regelwerk gespeichert und ausgewählt.'); showMmRulesPage(); return; }
+  if(id==='mmHowTo'){ showMmHowTo(); return; }
+  if(id==='mmHowBack'){ if(mmActive()&&!['mmrules'].includes(mmRulesRet)&&mmRulesRet==='game'){ overlay(''); render(); } else showMmRulesPage(); return; }
   if(id==='doUpdate'){
     if(mode==='host'&&HOST){ hostSave(); }
     reloading=true; const w=swReg&&swReg.waiting; if(w) w.postMessage('skipWaiting'); else location.reload(); return; }
   if(id==='laterUpdate'){ $('updateBar').hidden=true; return; }
-  if(id==='btnRules'){ if(!ovKey||ovKey==='menu'||ovKey==='lobby'){ if(svActive()&&!ovKey) showSvRules(''); else { rulesReturn=ovKey; showRules(); } } return; }
+  if(id==='btnRules'){ if(!ovKey||ovKey==='menu'||ovKey==='lobby'){ if(svActive()&&!ovKey) showSvRules(''); else if(mmActive()&&!ovKey){ mmRulesRet='game'; showMmHowTo(); } else { rulesReturn=ovKey; showRules(); } } return; }
   /* Schiffe versenken */
   if(id==='svVsCpu'){ svStartVsCpu(); return; }
   if(id==='svOnline'||id==='hostRoomSv'){ hostGame(null,'schiffe'); return; }
@@ -1706,16 +2098,20 @@ document.addEventListener('click',async e=>{
   if(id==='wipeData'){
     if(t.dataset.sure!=='1'){ t.dataset.sure='1'; t.textContent='Wirklich löschen? Nochmal tippen'; return; }
     stopNet(); LS_KEYS.forEach(lsDel); myName=''; myTok=randHex(16); lsSet('etappen-token',myTok); themeKey='auto'; animOff=false; applyTheme();
-    mode='local'; G=null; SV=null; SVV=null; render(); toast('Deine Daten auf diesem Gerät wurden gelöscht.'); showMenu(); return; }
+    mode='local'; G=null; SV=null; SVV=null; MM=null; MMV=null; render(); toast('Deine Daten auf diesem Gerät wurden gelöscht.'); showMenu(); return; }
   if(id==='btnNew'){ if(ovKey!=='menu') showMenu(); return; }
   if(id==='closeOv'){ overlay(''); render(); return; }
   if(id==='install'){ if(installEvt){ installEvt.prompt(); try{ await installEvt.userChoice; }catch(_){} installEvt=null; showMenu(); } return; }
   if(id==='localSetup'){ readName(); showSetup(); return; }
   if(id==='backMenu'){ readSetupNames(); showMenu(); return; }
-  if(t.dataset.count){readSetupNames(); const n=int(t.dataset.count,2,6,4); while(setupCfg.length<n) setupCfg.push({name:'Spieler '+(setupCfg.length+1),ai:true,av:randomAv()}); setupCfg=setupCfg.slice(0,n); showSetup(); return;}
-  if(t.dataset.type){readSetupNames(); const [i,v]=t.dataset.type.split(',').map(Number); if(setupCfg[i]) setupCfg[i].ai=!!v; showSetup(); return;}
-  if(id==='startLocal'){ readSetupNames(); lsSet('etappen-setup',JSON.stringify(setupCfg)); stopNet(); overlay('');
-    mode='local'; SV=null; SVV=null; G=newGameState(setupCfg); const h=humans(); viewer=h.length===1?h[0]:null; covered=false; startRound(); changed(); return; }
+  if(t.dataset.count){readSetupNames(); const n=int(t.dataset.count,2,6,4), cfg=SC(); while(cfg.length<n) cfg.push({name:'Computer '+cfg.length,ai:true,av:randomAv()}); setupCfgs[setupGame]=cfg.slice(0,n); showSetup(); return;}
+  if(t.dataset.type){readSetupNames(); const [i,v]=t.dataset.type.split(',').map(Number); if(SC()[i]) SC()[i].ai=!!v; showSetup(); return;}
+  if(id==='startLocal'){ readSetupNames(); const cfg=SC();
+    if(setupGame!=='etappen'&&!cfg.some(p=>!p.ai)){ toast('Mindestens ein Mensch muss mitspielen.'); return; }
+    lsSet(SETUP_KEY[setupGame],JSON.stringify(cfg)); stopNet(); overlay('');
+    if(setupGame==='schiffe'){ svStartLocal(cfg); return; }
+    if(setupGame==='maumau'){ mmStartLocal(cfg); return; }
+    mode='local'; SV=null; SVV=null; MM=null; MMV=null; G=newGameState(cfg); const h=humans(); viewer=h.length===1?h[0]:null; covered=false; startRound(); changed(); return; }
   if(id==='hostRoom'){ hostGame(null,'etappen'); return; }
   if(id==='resumeHost'){ const sh=savedHost(); if(sh) hostGame(sh); return; }
   if(id==='joinRoom'){ joinGame($('codeIn').value); return; }
@@ -1732,7 +2128,7 @@ document.addEventListener('click',async e=>{
   if(id==='addBot'&&HOST){ if(HOST.seats.length<6){ const n=HOST.seats.filter(s=>s.ai).length+1; HOST.seats.push({tok:'bot-'+randHex(6),name:'Computer '+n,ai:true,av:randomAv()}); hostSave(); showLobby(); hostBroadcast(); } return; }
   if(t.dataset.kick!=null&&HOST){ const k=int(t.dataset.kick,0,5,-1); const s=HOST.seats[k]; if(s&&s.tok!==myTok&&HOST.status==='lobby'){ HOST.seats.splice(k,1); HOST.clients.forEach((c,cid)=>{ if(c.tok===s.tok){ hostSend(c,{t:'kicked'}); HOST.clients.delete(cid);} }); hostSave(); showLobby(); hostBroadcast(); } return; }
   if(id==='startOnline'){ hostStart(); return; }
-  if(id==='leaveRoom'||id==='toMenu'){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; SV=null; SVV=null; render(); showMenu(); return; }
+  if(id==='leaveRoom'||id==='toMenu'){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; SV=null; SVV=null; MM=null; MMV=null; render(); showMenu(); return; }
   if(id==='uncover'){covered=false; viewer=G.cur; overlay(''); render(); return;}
   if(id==='nextRound'){ if(mode!=='client'){ overlay(''); startRound(); changed(); } return; }
   if(id==='again'){ if(mode!=='client'){ overlay(''); G=newGameState(G.players.map(p=>({name:p.name,ai:p.ai,tok:p.tok,av:p.av}))); if(mode==='local'){const h=humans(); viewer=h.length===1?h[0]:null;} startRound(); changed(); } return; }
@@ -1785,6 +2181,7 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Enter'&&e.target.id==='codeIn'){ $('joinRoom').click(); }
 });
 document.addEventListener('input',e=>{ if(e.target.id==='nameIn'){ myName=str(e.target.value,16); lsSet('etappen-name',myName);} });
+document.addEventListener('change',e=>{ if(e.target.id==='mmDeckSel'&&mmEdit){ mmReadForm(); showMmEditor(); } });
 window.addEventListener('beforeunload',e=>{ if(mode==='host'&&HOST&&onlineCount()&&!reloading){ e.preventDefault(); e.returnValue=''; } });
 
 /* ---------- Zurück-Geste (Android-Wischen, Zurück-Taste, Browser-Zurück) ----------
@@ -1802,20 +2199,24 @@ function armOrDo(msg,fn){
   if(now-backArmed<2500){ backArmed=0; fn(); }
   else { backArmed=now; toast(msg); }
 }
-function leaveGame(){ stopNet(); mode='local'; G=null; SV=null; SVV=null; covered=false; render(); showMenu(); toast('Spiel verlassen.'); }
+function leaveGame(){ stopNet(); mode='local'; G=null; SV=null; SVV=null; MM=null; MMV=null; covered=false; render(); showMenu(); toast('Spiel verlassen.'); }
 function handleBack(){
   switch(ovKey){
     case 'online': case 'settings': case 'privacy': case 'setup': readName(); showMenu(); return;
     case 'rules': { const b=$('rulesBack')||$('svRulesBack'); if(b) b.click(); return; }
+    case 'mmrules': { const b=$('mmRulesBack'); if(b) b.click(); return; }
+    case 'mmedit': mmEdit=null; showMmRulesPage(); return;
+    case 'mmhow': { const b=$('mmHowBack'); if(b) b.click(); return; }
+    case 'mmwish': mmPick=null; overlay(''); render(); return;
     case 'avatar': closeAvatarEditor(); return;
     case 'skip': overlay(''); render(); return;
     case 'wait': case 'notfound': leaveToMenu(); return;
     case 'menu':
-      if(G||svActive()){ overlay(''); render(); return; }   // zurück ins laufende Spiel
+      if(G||svActive()||mmActive()){ overlay(''); render(); return; }   // zurück ins laufende Spiel
       armOrDo('Nochmal zurück wischen, um die App zu schließen.',()=>{ exiting=true; history.go(-2); });
       return;
   }
-  if(G||svActive()||ovKey==='lobby'||ovKey==='cover'||ovKey.startsWith('end')||ovKey.startsWith('svend')){
+  if(G||svActive()||mmActive()||ovKey==='lobby'||ovKey==='cover'||ovKey.startsWith('end')||ovKey.startsWith('svend')||ovKey.startsWith('mmend')){
     armOrDo(mode==='local'?'Nochmal zurück wischen, um das Spiel zu verlassen.':'Nochmal zurück wischen, um den Raum zu verlassen.', leaveGame);
     return;
   }
