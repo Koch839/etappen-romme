@@ -1,7 +1,7 @@
 /* Etappen-Rommé – Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.4.0';
+const APP_VERSION='1.4.1';
 const PROTO=4;                      // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
@@ -1321,7 +1321,43 @@ document.addEventListener('keydown',e=>{
 document.addEventListener('input',e=>{ if(e.target.id==='nameIn'){ myName=str(e.target.value,16); lsSet('etappen-name',myName);} });
 window.addEventListener('beforeunload',e=>{ if(mode==='host'&&HOST&&onlineCount()&&!reloading){ e.preventDefault(); e.returnValue=''; } });
 
+/* ---------- Zurück-Geste (Android-Wischen, Zurück-Taste, Browser-Zurück) ----------
+   Es liegt immer ein „Wächter“-Eintrag im Verlauf. Wird zurückgewischt, fangen wir das ab,
+   legen den Wächter neu an und gehen in der App einen Schritt zurück. */
+let backArmed=0, exiting=false;
+function setupBack(){ try{ history.replaceState({er:'base'},''); history.pushState({er:'guard'},''); }catch(e){} }
+window.addEventListener('popstate',()=>{
+  if(exiting) return;
+  try{ history.pushState({er:'guard'},''); }catch(e){}
+  handleBack();
+});
+function armOrDo(msg,fn){
+  const now=Date.now();
+  if(now-backArmed<2500){ backArmed=0; fn(); }
+  else { backArmed=now; toast(msg); }
+}
+function leaveGame(){ stopNet(); mode='local'; G=null; covered=false; render(); showMenu(); toast('Spiel verlassen.'); }
+function handleBack(){
+  switch(ovKey){
+    case 'online': case 'settings': case 'privacy': case 'setup': readName(); showMenu(); return;
+    case 'rules': { const b=$('rulesBack'); if(b) b.click(); return; }
+    case 'avatar': closeAvatarEditor(); return;
+    case 'skip': overlay(''); render(); return;
+    case 'wait': case 'notfound': leaveToMenu(); return;
+    case 'menu':
+      if(G){ overlay(''); render(); return; }   // zurück ins laufende Spiel
+      armOrDo('Nochmal zurück wischen, um die App zu schließen.',()=>{ exiting=true; history.go(-2); });
+      return;
+  }
+  if(G||ovKey==='lobby'||ovKey==='cover'||ovKey.startsWith('end')){
+    armOrDo(mode==='local'?'Nochmal zurück wischen, um das Spiel zu verlassen.':'Nochmal zurück wischen, um den Raum zu verlassen.', leaveGame);
+    return;
+  }
+  showMenu();
+}
+
 /* ---------- Start ---------- */
+setupBack();
 render();
 if(inviteCode){ showOnline(); toast('Einladung erkannt: Gib deinen Namen ein und tippe „Beitreten“.'); } else showMenu();
 setupSW();
