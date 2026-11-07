@@ -1,7 +1,7 @@
 // Offline-Speicher und Updates für Etappen-Rommé.
 // Bei JEDER neuen Version die Versionsnummer erhöhen (und in app.js APP_VERSION).
 // Die App merkt die neue Version dann von selbst und bietet „Jetzt aktualisieren“ an.
-const VERSION = '1.5.0';
+const VERSION = '1.7.3';
 const CACHE = 'etappen-' + VERSION;
 const ASSETS = [
   './',

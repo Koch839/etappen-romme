@@ -5,13 +5,13 @@
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' wss://broker.hivemq.com:8884 wss://broker.emqx.io:8084; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Etappen-Rommé</title>
-<meta name="description" content="Rommé-Kartenspiel mit 10 Etappen – online mit Freunden oder an einem Gerät.">
+<title>Spielhafen</title>
+<meta name="description" content="Spielhafen: Etappen-Rommé und Schiffe versenken – online mit Freunden oder gegen den Computer.">
 <meta name="theme-color" content="#0f2a20">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="Etappen">
+<meta name="apple-mobile-web-app-title" content="Spielhafen">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" type="image/png" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
@@ -21,14 +21,23 @@
 <body>
 <div class="wrap">
   <header>
-    <h1>Etappen-Rommé <small id="roundInfo"></small></h1>
+    <h1>Spielhafen <small id="roundInfo"></small></h1>
     <div class="hdr-btns">
       <span class="netchip" id="netChip" hidden></span>
       <button class="btn" id="btnRules">Regeln</button>
       <button class="btn" id="btnNew">Menü</button>
     </div>
   </header>
-  <div class="board">
+  <div class="sv" id="sv" hidden>
+    <div class="sv-players" id="svPlayers"></div>
+    <div class="status sv-status"><div class="msg" id="svMsg"></div><div class="sub" id="svSub"></div><div class="log" id="svLog"></div></div>
+    <div class="sv-boards">
+      <div class="sv-wrap" id="svOppWrap"><h3 class="sv-title" id="svOppTitle"></h3><div class="sv-grid opp" id="svOpp"></div><div id="svAbil"></div></div>
+      <div class="sv-wrap own" id="svMeWrap"><h3 class="sv-title" id="svMeTitle"></h3><div class="sv-grid" id="svMe"></div></div>
+    </div>
+    <div class="sv-ctrl" id="svCtrl"></div>
+  </div>
+  <div class="board" id="board">
     <div class="players" id="players"></div>
     <div class="center" id="center">
       <div class="pile"><div id="deckSlot"></div><span id="deckCount">Stapel</span></div>

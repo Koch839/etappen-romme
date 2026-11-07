@@ -1,7 +1,7 @@
 {
-  "name": "Etappen-Rommé",
-  "short_name": "Etappen",
-  "description": "Rommé-Kartenspiel mit 10 Etappen – online mit Freunden oder an einem Gerät.",
+  "name": "Spielhafen",
+  "short_name": "Spielhafen",
+  "description": "Etappen-Rommé und Schiffe versenken – online mit Freunden oder gegen den Computer.",
   "lang": "de",
   "start_url": "./",
   "scope": "./",
