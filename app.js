@@ -1,12 +1,15 @@
-/* Etappen-Rommé – Spiellogik, Online-Modus (PeerJS) und Oberfläche */
+/* Etappen-Rommé – Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.1.0';
-const PROTO=2;                       // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
-const PEER_PREFIX='etappen-romme-v2-';
-const CODE_LEN=5;
+const APP_VERSION='1.2.0';
+const PROTO=3;                       // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
+const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
 const MAX_MSG_PER_SEC=25;
+// Öffentliche MQTT-Server. Beide werden gleichzeitig genutzt; fällt einer aus, läuft es über den anderen.
+// Sie sehen nur verschlüsselte Daten.
+const BROKERS=['wss://broker.hivemq.com:8884/mqtt','wss://broker.emqx.io:8084/mqtt'];
+const TOPIC_ROOT='etappen-romme/v3/';
 
 const COLOR_NAMES=['Rot','Blau','Grün','Gelb'];
 const COLOR_SYM=['●','■','▲','◆'];
@@ -85,9 +88,10 @@ let G=null, mode='local';
 let sel=new Set(), viewer=null, covered=false, sortMode='num', aiBusy=false, ovKey='';
 let myName=str(lsGet('etappen-name'),16);
 let myTok=lsGet('etappen-token'); if(!myTok||!/^[0-9a-f]{32}$/.test(myTok)){ myTok=randHex(16); lsSet('etappen-token',myTok); }
-let peer=null;
-let HOST=null;     // {code, status, seats:[{tok,name,ai}], conns:Set, live:Set}
-let CLIENT=null;   // {code, conn, you, lobby, hostName, status, closedByUs}
+let HOST=null;     // {code, keys, ecdh, status, seats:[{tok,name,ai}], clients:Map}
+let CLIENT=null;   // {code, keys, ecdh, cid, key, you, lobby, hostName, lastHost, sn, seq, pending}
+let NET=null;      // Verbindung zu den MQTT-Servern
+let hostTimer=null, clientTimer=null;
 
 /* ---------- cards ---------- */
 function makeDeck(){
@@ -314,7 +318,7 @@ function myTurn(){
   return mySeat()===G.cur;
 }
 function act(a){
-  if(mode==='client'){ clientSend({t:'act',a}); if(a.type!=='lay') sel.clear(); return; }
+  if(mode==='client'){ if(!hostReachable()){ toast('Keine Verbindung zum Gastgeber – ich versuche es weiter …'); return; } clientAct(a); if(a.type!=='lay') sel.clear(); return; }
   const err=applyAction(G.cur,a);
   if(err){ toast(err); return; }
   sel.clear(); changed();
@@ -359,62 +363,197 @@ async function runAI(){
   }catch(err){ aiBusy=false; if(err!=='stale') throw err; maybeAI(); }
 }
 
+/* ---------- Bytes & Verschlüsselung ---------- */
+const te=new TextEncoder(), td=new TextDecoder();
+function cat(...parts){ let n=0; parts.forEach(p=>n+=p.length); const o=new Uint8Array(n); let i=0; parts.forEach(p=>{ o.set(p,i); i+=p.length; }); return o; }
+function b64(u8){ let s=''; for(let i=0;i<u8.length;i+=0x8000) s+=String.fromCharCode.apply(null,u8.subarray(i,i+0x8000)); return btoa(s); }
+function unb64(s){ try{ const bin=atob(String(s)); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; }catch(e){ return new Uint8Array(0); } }
+function hex(u8){ return Array.from(u8,x=>x.toString(16).padStart(2,'0')).join(''); }
+async function aesEnc(key,obj){
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,te.encode(JSON.stringify(obj))));
+  return cat(iv,ct);
+}
+async function aesDec(key,u8){
+  try{ if(!(u8 instanceof Uint8Array)||u8.length<29||u8.length>600000) return null;
+    const pt=await crypto.subtle.decrypt({name:'AES-GCM',iv:u8.subarray(0,12)},key,u8.subarray(12));
+    return JSON.parse(td.decode(pt));
+  }catch(e){ return null; }
+}
+/* Aus dem Raum-Code werden Schlüssel und (geheimer) Kanalname abgeleitet. Ohne Code kann niemand mitlesen. */
+async function roomKeys(code){
+  const base=await crypto.subtle.importKey('raw',te.encode(code),'PBKDF2',false,['deriveBits']);
+  const bits=new Uint8Array(await crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt:te.encode('etappen-romme/v3/room'),iterations:200000},base,384));
+  const key=await crypto.subtle.importKey('raw',bits.slice(0,32),'AES-GCM',false,['encrypt','decrypt']);
+  return {key, topic:TOPIC_ROOT+hex(bits.slice(32,48))};
+}
+/* Zusätzlich hat jeder Mitspieler einen eigenen Schlüssel mit dem Gastgeber (ECDH).
+   So können andere im Raum die Karten der anderen nicht entschlüsseln. */
+async function newECDH(){
+  const kp=await crypto.subtle.generateKey({name:'ECDH',namedCurve:'P-256'},false,['deriveBits']);
+  const pub=b64(new Uint8Array(await crypto.subtle.exportKey('raw',kp.publicKey)));
+  return {kp,pub};
+}
+async function pairKey(kp,pubB64){
+  const pk=await crypto.subtle.importKey('raw',unb64(pubB64),{name:'ECDH',namedCurve:'P-256'},false,[]);
+  const bits=await crypto.subtle.deriveBits({name:'ECDH',public:pk},kp.privateKey,256);
+  const hk=await crypto.subtle.importKey('raw',bits,'HKDF',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'HKDF',hash:'SHA-256',salt:te.encode('etappen-romme/v3/pair'),info:new Uint8Array(0)},hk,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+
+/* ---------- kleiner MQTT-Client über WebSocket ---------- */
+function str16(s){ const b=te.encode(s); return cat([b.length>>8,b.length&255],b); }
+function mqttPkt(h,body){ const len=[]; let x=body.length; do{ let d=x%128; x=Math.floor(x/128); if(x>0) d|=128; len.push(d); }while(x>0); return cat([h],len,body); }
+class MqttLink{
+  constructor(url,onMsg,onChange){ this.url=url; this.onMsg=onMsg; this.onChange=onChange; this.subs=new Set(); this.ok=false; this.closed=false; this.buf=new Uint8Array(0); this.pid=1; this.retry=0; this.open(); }
+  open(){
+    if(this.closed) return;
+    let ws; try{ ws=new WebSocket(this.url,'mqtt'); }catch(e){ this.later(); return; }
+    this.ws=ws; this.buf=new Uint8Array(0); ws.binaryType='arraybuffer';
+    ws.onopen=()=>{ try{ ws.send(mqttPkt(0x10,cat([0,4,77,81,84,84,4,2,0,45],str16('etr'+randHex(10))))); }catch(e){} };
+    ws.onmessage=e=>{ if(this.ws===ws) this.feed(new Uint8Array(e.data)); };
+    ws.onclose=()=>{ if(this.ws!==ws) return; const was=this.ok; this.ok=false; clearInterval(this.ping); if(was) this.onChange(); this.later(); };
+    ws.onerror=()=>{};
+  }
+  later(){ if(this.closed) return; clearTimeout(this.rt); const d=Math.min(10000,800*Math.pow(2,this.retry++)); this.rt=setTimeout(()=>this.open(),d); }
+  kick(){ if(this.closed) return; if(!this.ws||this.ws.readyState>1){ this.retry=0; clearTimeout(this.rt); this.open(); } }
+  feed(chunk){
+    let b=cat(this.buf,chunk);
+    for(;;){
+      if(b.length<2) break;
+      let mul=1,len=0,i=1,byte,bad=false;
+      do{ if(i>=b.length){ i=-1; break; } byte=b[i++]; len+=(byte&127)*mul; mul*=128; if(mul>268435456){ bad=true; break; } }while(byte&128);
+      if(bad||len>1048576){ try{this.ws.close();}catch(e){} return; }
+      if(i<0||b.length<i+len) break;
+      this.handle(b[0],b.subarray(i,i+len));
+      b=b.subarray(i+len);
+    }
+    this.buf=b.slice();
+  }
+  handle(h,body){
+    const type=h>>4;
+    if(type===2){ // CONNACK
+      if(body[1]!==0){ try{this.ws.close();}catch(e){} return; }
+      this.ok=true; this.retry=0; this.subs.forEach(t=>this.sendSub(t));
+      clearInterval(this.ping); const ws=this.ws; this.ping=setInterval(()=>{ try{ ws.send(new Uint8Array([0xC0,0])); }catch(e){} },20000);
+      this.onChange();
+    } else if(type===3){ // PUBLISH
+      if(body.length<2) return;
+      const tl=(body[0]<<8)|body[1]; let p=2+tl; if((h>>1)&3) p+=2;
+      this.onMsg(td.decode(body.subarray(2,2+tl)), body.slice(p));
+    }
+  }
+  sendSub(t){ this.pid=(this.pid%65535)+1; try{ this.ws.send(mqttPkt(0x82,cat([this.pid>>8,this.pid&255],str16(t),[0]))); }catch(e){} }
+  sub(t){ this.subs.add(t); if(this.ok) this.sendSub(t); }
+  pub(t,payload){ if(!this.ok) return false; try{ this.ws.send(mqttPkt(0x30,cat(str16(t),payload))); return true; }catch(e){ return false; } }
+  close(){ this.closed=true; clearTimeout(this.rt); clearInterval(this.ping); try{ if(this.ok) this.ws.send(new Uint8Array([0xE0,0])); this.ws.close(); }catch(e){} this.ok=false; }
+}
+
+/* ---------- Netz: beide Server, Verschlüsselung, Doppelte aussortieren ---------- */
+function netStart(keys,listenTopic,onEnv){
+  const net={keys,links:[],seen:new Set(),seenQ:[]};
+  const onMsg=async(topic,payload)=>{
+    if(NET!==net||topic!==listenTopic) return;
+    const env=await aesDec(keys.key,payload);
+    if(!env||typeof env!=='object'||typeof env.m!=='string'||net.seen.has(env.m)) return;
+    net.seen.add(env.m); net.seenQ.push(env.m); if(net.seenQ.length>500) net.seen.delete(net.seenQ.shift());
+    onEnv(env);
+  };
+  const onChange=()=>{ if(NET!==net) return; render(); netChanged(); };
+  NET=net;
+  net.links=BROKERS.map(u=>new MqttLink(u,onMsg,onChange));
+  net.links.forEach(l=>l.sub(listenTopic));
+  return net;
+}
+async function netSend(topic,env){
+  const net=NET; if(!net) return;
+  env.m=randHex(8);
+  const bytes=await aesEnc(net.keys.key,env);
+  net.links.forEach(l=>l.pub(topic,bytes));
+}
+const netOnline=()=>!!NET&&NET.links.some(l=>l.ok);
+function netKick(){ if(NET) NET.links.forEach(l=>l.kick()); }
+function netChanged(){
+  if(mode==='host') hostBroadcast();
+  else if(mode==='client'&&CLIENT){ if(!CLIENT.key) clientHello(); else clientSendMsg({t:'ping'}); }
+}
+function stopNet(){
+  clearInterval(hostTimer); clearInterval(clientTimer); hostTimer=clientTimer=null;
+  const net=NET;
+  if(net&&mode==='client'&&CLIENT&&CLIENT.key) clientSendMsg({t:'bye'});
+  NET=null;
+  if(net) setTimeout(()=>net.links.forEach(l=>l.close()),400);
+  HOST=null; CLIENT=null;
+}
+
 /* ---------- Online: Gastgeber ---------- */
 const CODE_CHARS='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const CODE_RE=new RegExp('^['+CODE_CHARS+']{'+CODE_LEN+'}$');
 function newCode(){let s=''; for(let i=0;i<CODE_LEN;i++) s+=CODE_CHARS[randInt(CODE_CHARS.length)]; return s;}
-function peerOK(){ if(typeof Peer==='undefined'){ toast('Online-Spiel braucht eine Internetverbindung.'); return false; } return true; }
-function stopNet(){
-  if(CLIENT){ CLIENT.closedByUs=true; try{CLIENT.conn&&CLIENT.conn.close();}catch(e){} }
-  if(peer){ try{peer.destroy();}catch(e){} }
-  peer=null; HOST=null; CLIENT=null;
-}
+const normCode=s=>String(s||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,CODE_LEN);
+const fmtCode=c=>c.slice(0,4)+'-'+c.slice(4);
+const cryptoOK=()=>{ if(!(window.crypto&&crypto.subtle)){ toast('Dein Browser unterstützt die Verschlüsselung nicht. Bitte aktualisiere ihn.'); return false; } return true; };
 function hostSave(){
   if(!HOST) return;
   lsSet('etappen-host',JSON.stringify({code:HOST.code,status:HOST.status,seats:HOST.seats,G,ts:Date.now()}));
 }
 function savedHost(){ try{ const s=JSON.parse(lsGet('etappen-host')); if(s&&CODE_RE.test(s.code)&&Date.now()-s.ts<48*3600e3) return s; }catch(e){} return null; }
-function rateOK(conn){ const now=Date.now(); if(!conn._t||now-conn._t>1000){conn._t=now;conn._n=0;} return ++conn._n<=MAX_MSG_PER_SEC; }
+function rateOK(c){ const now=Date.now(); if(!c._t||now-c._t>1000){c._t=now;c._n=0;} return ++c._n<=MAX_MSG_PER_SEC; }
+const isOnline=c=>Date.now()-c.last<35000;
 
-function hostGame(resume){
-  if(!peerOK()) return;
+async function hostGame(resume){
+  if(!cryptoOK()) return;
   const name=readName(); if(!resume&&!name){toast('Bitte gib zuerst deinen Namen ein.'); return;}
-  stopNet(); G=null; mode='local';
+  stopNet(); G=null; mode='local'; render();
+  overlay(`<h2>Raum wird geöffnet …</h2><p class="note">Verschlüsselung wird vorbereitet.</p>`,'wait');
   const code=resume?resume.code:newCode();
-  overlay(`<h2>Raum wird geöffnet …</h2><p class="note">Verbindung zum Vermittlungsserver wird aufgebaut.</p>`,'wait');
-  let tries=0;
-  const open=()=>{
-    peer=new Peer(PEER_PREFIX+code,{debug:0});
-    peer.on('open',()=>{
-      mode='host';
-      HOST=resume?{code,status:resume.status,seats:resume.seats,conns:new Set(),live:new Set()}:{code,status:'lobby',seats:[{tok:myTok,name,ai:false}],conns:new Set(),live:new Set()};
-      if(resume&&resume.G){ G=resume.G; }
-      hostSave(); keepAwake();
-      if(HOST.status==='lobby'){ G=null; render(); showLobby(); } else { overlay(''); changed(); }
-    });
-    peer.on('connection',conn=>{
-      if(!HOST||HOST.live.size>=MAX_CONNS){ conn.on('open',()=>{ try{conn.close();}catch(e){} }); return; }
-      HOST.live.add(conn);
-      conn.on('data',d=>{ if(!rateOK(conn)){ try{conn.close();}catch(e){} return; } hostOnData(conn,d); });
-      conn.on('close',()=>{ if(HOST){ HOST.live.delete(conn); HOST.conns.delete(conn); render(); if(HOST.status==='lobby') showLobby(); else hostBroadcast(); } });
-      conn.on('error',()=>{});
-    });
-    peer.on('disconnected',()=>{ try{ if(peer&&!peer.destroyed) peer.reconnect(); }catch(e){} });
-    peer.on('error',e=>{
-      if(e.type==='unavailable-id'){
-        try{peer.destroy();}catch(_){}
-        if(resume&&++tries<8){ setTimeout(open,3000); return; }
-        if(!resume&&++tries<5){ hostGame(); return; }
-        overlay(''); toast('Der Raum ist gerade noch belegt. Versuch es gleich nochmal.'); showMenu(); return;
-      }
-      if(e.type==='network'||e.type==='server-error'||e.type==='socket-error'){ toast('Keine Verbindung zum Vermittlungsserver. Prüfe dein Internet.'); }
-    });
-  };
-  open();
+  const keys=await roomKeys(code), ecdh=await newECDH();
+  mode='host';
+  HOST={code,keys,ecdh,status:resume?resume.status:'lobby',seats:resume?resume.seats:[{tok:myTok,name,ai:false}],clients:new Map()};
+  G=resume&&resume.status==='game'?resume.G:null;
+  netStart(keys,keys.topic+'/h',hostOnEnv);
+  hostSave(); keepAwake();
+  hostTimer=setInterval(hostTick,10000);
+  if(HOST.status==='lobby'){ render(); showLobby(); } else { overlay(''); changed(); }
 }
-function hostSend(conn,msg){ try{ if(conn.open) conn.send(msg); }catch(e){} }
-function seatOf(conn){ if(!G||!conn.tok) return null; const i=G.players.findIndex(p=>p.tok===conn.tok); return i<0?null:i; }
-function onlineToks(){ const s=new Set([myTok]); HOST&&HOST.conns.forEach(c=>c.tok&&s.add(c.tok)); return s; }
+function hostTick(){
+  if(mode!=='host'||!HOST) return;
+  const now=Date.now(); HOST.clients.forEach((c,cid)=>{ if(now-c.last>180000) HOST.clients.delete(cid); });
+  hostBroadcast(); render();
+  if(HOST.status==='lobby'&&ovKey==='lobby') showLobby();
+}
+function hostSendRaw(cid,payload){ if(HOST) netSend(HOST.keys.topic+'/c/'+cid,{f:'host',p:payload}); }
+async function hostSend(c,msg){ if(!HOST||!c.key) return; const x=b64(await aesEnc(c.key,msg)); hostSendRaw(c.cid,{x}); }
+async function hostOnEnv(env){
+  if(!HOST) return;
+  const cid=str(env.f,32); if(!/^[0-9a-f]{16}$/.test(cid)) return;
+  const p=env.p; if(!p||typeof p!=='object') return;
+  let c=HOST.clients.get(cid);
+  if(c&&!rateOK(c)) return;
+  if(p.t==='hello'){
+    if(p.v!==PROTO){ hostSendRaw(cid,{t:'deny',msg:'Deine App-Version passt nicht zu der des Gastgebers. Bitte beide die App aktualisieren.'}); return; }
+    if(!c&&HOST.clients.size>=MAX_CONNS){
+      for(const [k,o] of HOST.clients) if(!isOnline(o)) HOST.clients.delete(k);
+      if(HOST.clients.size>=MAX_CONNS){ hostSendRaw(cid,{t:'deny',msg:'Der Raum ist voll.'}); return; }
+    }
+    let key; try{ key=await pairKey(HOST.ecdh.kp,str(p.pub,200)); }catch(e){ return; }
+    if(!HOST) return;
+    c=HOST.clients.get(cid)||{cid,tok:null,lastSeq:0,sn:0};
+    c.key=key; c.last=Date.now(); HOST.clients.set(cid,c);
+    hostSendRaw(cid,{t:'welcome',v:PROTO,pub:HOST.ecdh.pub});
+    return;
+  }
+  if(typeof p.x!=='string') return;
+  if(!c||!c.key){ hostSendRaw(cid,{t:'rehello'}); return; }
+  const msg=await aesDec(c.key,unb64(p.x));
+  if(!msg||typeof msg!=='object'){ hostSendRaw(cid,{t:'rehello'}); return; }
+  if(!HOST) return;
+  c.last=Date.now();
+  hostOnMsg(c,msg);
+}
+function seatOf(c){ if(!G||!c.tok) return null; const i=G.players.findIndex(p=>p.tok===c.tok); return i<0?null:i; }
+function onlineToks(){ const s=new Set([myTok]); HOST&&HOST.clients.forEach(c=>{ if(c.tok&&isOnline(c)) s.add(c.tok); }); return s; }
+function onlineCount(){ let n=0; HOST&&HOST.clients.forEach(c=>{ if(c.tok&&isOnline(c)) n++; }); return n; }
 function viewFor(seat){
   const v=JSON.parse(JSON.stringify(G));
   const on=onlineToks();
@@ -422,39 +561,43 @@ function viewFor(seat){
   v.deckN=G.deck.length; v.deck=[];
   return v;
 }
-function lobbyMsg(conn){
-  return {t:'lobby',v:PROTO,code:HOST.code,seats:HOST.seats.map(s=>({name:s.name,ai:s.ai,me:s.tok===conn.tok,host:s.tok===myTok}))};
+function hostSendView(c){
+  if(!HOST||!c.tok) return;
+  if(HOST.status==='lobby') hostSend(c,{t:'lobby',v:PROTO,code:HOST.code,seats:HOST.seats.map(s=>({name:s.name,ai:s.ai,me:s.tok===c.tok,host:s.tok===myTok}))});
+  else { const seat=seatOf(c); hostSend(c,{t:'state',v:PROTO,sn:++c.sn,ack:c.lastSeq,you:seat,view:viewFor(seat),hostName:HOST.seats[0].name}); }
 }
-function hostBroadcast(){
-  if(!HOST) return;
-  HOST.conns.forEach(conn=>{
-    if(HOST.status==='lobby') hostSend(conn,lobbyMsg(conn));
-    else { const seat=seatOf(conn); hostSend(conn,{t:'state',v:PROTO,code:HOST.code,you:seat,view:viewFor(seat),hostName:HOST.seats[0].name}); }
-  });
-}
-function hostOnData(conn,d){
-  if(!HOST||!d||typeof d!=='object') return;
-  if(d.t==='hello'){
-    if(d.v!==PROTO){ hostSend(conn,{t:'deny',msg:'Deine App-Version passt nicht zu der des Gastgebers. Bitte beide die App aktualisieren.'}); setTimeout(()=>{try{conn.close();}catch(e){}},300); return; }
-    const tok=str(d.tok,64); if(!/^[0-9a-f]{32}$/.test(tok)||tok===myTok){ try{conn.close();}catch(e){} return; }
-    conn.tok=tok; const name=str(d.name,16)||'Gast';
-    let seat=HOST.seats.find(s=>s.tok===conn.tok);
+function hostBroadcast(){ if(HOST) HOST.clients.forEach(c=>hostSendView(c)); }
+function hostOnMsg(c,d){
+  if(d.t==='join'){
+    const tok=str(d.tok,64); if(!/^[0-9a-f]{32}$/.test(tok)||tok===myTok) return;
+    const name=str(d.name,16)||'Gast';
+    HOST.clients.forEach((o,k)=>{ if(o!==c&&o.tok===tok) HOST.clients.delete(k); });
+    c.tok=tok;
+    let seat=HOST.seats.find(s=>s.tok===tok);
     if(!seat){
-      if(HOST.status!=='lobby'){ hostSend(conn,{t:'info',msg:'Das Spiel läuft schon – du schaust zu.'}); }
-      else if(HOST.seats.length>=6){ hostSend(conn,{t:'deny',msg:'Der Raum ist voll (6 Spieler).'}); setTimeout(()=>{try{conn.close();}catch(e){}},300); return; }
-      else { HOST.seats.push({tok:conn.tok,name,ai:false}); }
+      if(HOST.status!=='lobby') hostSend(c,{t:'info',msg:'Das Spiel läuft schon – du schaust zu.'});
+      else if(HOST.seats.length>=6){ hostSend(c,{t:'deny',msg:'Der Raum ist voll (6 Spieler).'}); HOST.clients.delete(c.cid); return; }
+      else HOST.seats.push({tok,name,ai:false});
     } else if(HOST.status==='lobby') seat.name=name;
-    HOST.conns.forEach(c=>{ if(c!==conn&&c.tok===conn.tok){ HOST.conns.delete(c); try{c.close();}catch(e){} } });
-    HOST.conns.add(conn);
     hostSave();
-    if(HOST.status==='lobby') showLobby();
+    if(HOST.status==='lobby'&&ovKey==='lobby') showLobby();
     hostBroadcast(); render();
     return;
   }
-  if(d.t==='act'&&HOST.status==='game'&&HOST.conns.has(conn)){
-    const seat=seatOf(conn); if(seat===null) return;
+  if(!c.tok) return;
+  if(d.t==='ping'){ hostSendView(c); return; }
+  if(d.t==='bye'){
+    HOST.clients.delete(c.cid);
+    if(HOST.status==='lobby'){ const i=HOST.seats.findIndex(s=>s.tok===c.tok&&s.tok!==myTok); if(i>=0) HOST.seats.splice(i,1); hostSave(); if(ovKey==='lobby') showLobby(); }
+    hostBroadcast(); render(); return;
+  }
+  if(d.t==='act'&&HOST.status==='game'){
+    const seq=int(d.seq,0,1e9,0);
+    if(seq&&seq<=c.lastSeq){ hostSendView(c); return; }   // doppelt angekommen
+    c.lastSeq=seq;
+    const seat=seatOf(c); if(seat===null) return;
     const err=applyAction(seat,d.a);
-    if(err) hostSend(conn,{t:'err',msg:err}); else changed();
+    if(err){ hostSend(c,{t:'err',msg:err,ack:seq}); hostSendView(c); } else changed();
   }
 }
 function hostStart(){
@@ -465,58 +608,93 @@ function hostStart(){
 }
 
 /* ---------- Online: Mitspieler ---------- */
-function joinGame(codeRaw){
-  if(!peerOK()) return;
+async function joinGame(codeRaw){
+  if(!cryptoOK()) return;
   const name=readName(); if(!name){toast('Bitte gib zuerst deinen Namen ein.'); return;}
-  const code=(codeRaw||'').trim().toUpperCase(); if(!CODE_RE.test(code)){toast(`Der Raum-Code hat ${CODE_LEN} Zeichen.`); return;}
-  stopNet(); G=null; mode='client'; CLIENT={code,conn:null,you:null,lobby:null,status:'connecting'};
+  const code=normCode(codeRaw); if(!CODE_RE.test(code)){toast(`Der Raum-Code hat ${CODE_LEN} Zeichen, zum Beispiel ABCD-2345.`); return;}
+  stopNet(); G=null; mode='client'; render();
+  overlay(`<h2>Verbinde mit Raum ${fmtCode(code)} …</h2><p class="note">Das dauert meist nur ein paar Sekunden.</p><div class="row"><button class="btn" id="toMenu">Abbrechen</button></div>`,'wait');
+  const keys=await roomKeys(code), ecdh=await newECDH();
+  if(mode!=='client') return;   // inzwischen abgebrochen
+  CLIENT={code,keys,ecdh,cid:randHex(8),key:null,you:null,lobby:null,hostName:'',lastHost:0,lastPing:0,lastHello:0,sn:0,seq:0,pending:null,start:Date.now()};
   lsSet('etappen-last',code);
+  netStart(keys,keys.topic+'/c/'+CLIENT.cid,clientOnEnv);
+  clientHello();
+  clientTimer=setInterval(clientTick,2500);
+}
+function clientHello(){ if(mode!=='client'||!CLIENT) return; CLIENT.lastHello=Date.now(); netSend(CLIENT.keys.topic+'/h',{f:CLIENT.cid,p:{t:'hello',v:PROTO,pub:CLIENT.ecdh.pub}}); }
+async function clientSendMsg(msg){
+  const C=CLIENT; if(!C||!C.key) return false;
+  const x=b64(await aesEnc(C.key,msg));
+  netSend(C.keys.topic+'/h',{f:C.cid,p:{x}}); return true;
+}
+function hostReachable(){ return !!CLIENT&&!!CLIENT.key&&Date.now()-CLIENT.lastHost<25000; }
+function clientTick(){
+  const C=CLIENT; if(mode!=='client'||!C) return;
+  const now=Date.now();
+  if(!C.key){
+    if(now-C.lastHello>3000) clientHello();
+    if(!C.lastHost&&now-C.start>20000&&ovKey==='wait') showNotFound();
+  } else {
+    if(now-C.lastPing>10000){ C.lastPing=now; clientSendMsg({t:'ping'}); }
+    if(now-C.lastHost>25000&&now-C.lastHello>6000){ C.key=null; clientHello(); }   // Gastgeber neu gestartet? neu anmelden
+  }
+  if(C.pending&&C.key&&now-C.pending.at>2500){
+    if(C.pending.tries<6){ C.pending.at=now; C.pending.tries++; clientSendMsg(C.pending.msg); } else C.pending=null;
+  }
   render();
-  overlay(`<h2>Verbinde mit Raum ${code} …</h2><p class="note">Das dauert meist nur ein paar Sekunden.</p><div class="row"><button class="btn" id="toMenu">Abbrechen</button></div>`,'wait');
-  peer=new Peer({debug:0});
-  peer.on('open',()=>connectToHost());
-  peer.on('disconnected',()=>{ try{ if(peer&&!peer.destroyed) peer.reconnect(); }catch(e){} });
-  peer.on('error',e=>{
-    if(e.type==='peer-unavailable'){ if(CLIENT&&CLIENT.status==='connecting'){ overlay(''); toast(`Raum ${code} wurde nicht gefunden. Ist der Gastgeber online?`); stopNet(); mode='local'; G=null; render(); showMenu(); } else showLost(); }
-    else if(e.type==='network'||e.type==='server-error'||e.type==='socket-error'){ toast('Keine Verbindung zum Vermittlungsserver. Prüfe dein Internet.'); }
-  });
 }
-function connectToHost(){
-  if(!CLIENT||!peer) return;
-  const conn=peer.connect(PEER_PREFIX+CLIENT.code,{reliable:true,serialization:'json'});
-  CLIENT.conn=conn;
-  const giveUp=setTimeout(()=>{ if(CLIENT&&CLIENT.conn===conn&&!conn.open){ showLost(); } },15000);
-  conn.on('open',()=>{ clearTimeout(giveUp); CLIENT.status='open'; conn.send({t:'hello',v:PROTO,tok:myTok,name:myName}); keepAwake(); render(); });
-  conn.on('data',d=>{ if(CLIENT&&CLIENT.conn===conn) clientOnData(d); });
-  conn.on('close',()=>{ if(CLIENT&&CLIENT.conn===conn&&!CLIENT.closedByUs){ CLIENT.status='lost'; render(); showLost(); } });
-  conn.on('error',()=>{});
+async function clientOnEnv(env){
+  const C=CLIENT; if(!C||env.f!=='host') return;
+  const p=env.p; if(!p||typeof p!=='object') return;
+  if(p.t==='welcome'){
+    if(p.v!==PROTO){ toast('Deine App-Version passt nicht zu der des Gastgebers. Bitte beide die App aktualisieren.'); return; }
+    let key; try{ key=await pairKey(C.ecdh.kp,str(p.pub,200)); }catch(e){ return; }
+    if(CLIENT!==C) return;
+    C.key=key; C.sn=0; C.lastHost=Date.now(); C.lastPing=Date.now();
+    clientSendMsg({t:'join',tok:myTok,name:myName});
+    if(C.pending){ C.pending.at=0; }
+    return;
+  }
+  if(p.t==='rehello'){ C.key=null; clientHello(); return; }
+  if(p.t==='deny'){ toast(str(p.msg,160)||'Der Gastgeber hat abgelehnt.'); leaveToMenu(); return; }
+  if(typeof p.x!=='string'||!C.key) return;
+  const msg=await aesDec(C.key,unb64(p.x));
+  if(CLIENT!==C) return;
+  if(!msg||typeof msg!=='object'){ C.key=null; clientHello(); return; }
+  C.lastHost=Date.now();
+  clientOnData(msg);
 }
-function clientSend(msg){ if(CLIENT&&CLIENT.conn&&CLIENT.conn.open) CLIENT.conn.send(msg); else { toast('Keine Verbindung zum Gastgeber.'); showLost(); } }
 function clientOnData(d){
-  if(!CLIENT||!d||typeof d!=='object') return;
+  const C=CLIENT; if(!C) return;
+  if(d.ack!=null&&C.pending&&int(d.ack,0,1e9,0)>=C.pending.seq) C.pending=null;
   if((d.t==='lobby'||d.t==='state')&&d.v!==PROTO){ toast('Deine App-Version passt nicht zu der des Gastgebers. Bitte beide die App aktualisieren.'); return; }
   if(d.t==='lobby'){
-    CLIENT.lobby={code:CLIENT.code,seats:(Array.isArray(d.seats)?d.seats:[]).slice(0,6).map(s=>({name:str(s&&s.name,16)||'?',ai:!!(s&&s.ai),me:!!(s&&s.me),host:!!(s&&s.host)}))};
-    G=null; render(); showLobby(); return;
+    C.lobby={code:C.code,seats:(Array.isArray(d.seats)?d.seats:[]).slice(0,6).map(s=>({name:str(s&&s.name,16)||'?',ai:!!(s&&s.ai),me:!!(s&&s.me),host:!!(s&&s.host)}))};
+    G=null; render(); if(['wait','lobby','notfound'].includes(ovKey)||!ovKey) showLobby(); return;
   }
   if(d.t==='state'){
+    const sn=int(d.sn,0,1e12,0); if(sn&&sn<=C.sn) return; C.sn=sn;
     const v=sanitizeView(d.view); if(!v) return;
-    G=v; CLIENT.you=d.you==null?null:int(d.you,0,v.players.length-1,null); CLIENT.hostName=str(d.hostName,16);
-    if(ovKey==='lobby'||ovKey==='wait'||ovKey==='lost') overlay('');
+    G=v; C.you=d.you==null?null:int(d.you,0,v.players.length-1,null); C.hostName=str(d.hostName,16);
+    if(['lobby','wait','notfound'].includes(ovKey)) overlay('');
     render(); return;
   }
   if(d.t==='err'||d.t==='info'){ toast(str(d.msg,160)); if(d.t==='err') render(); return; }
-  if(d.t==='deny'||d.t==='kicked'){ CLIENT.closedByUs=true; toast(str(d.msg,160)||'Der Gastgeber hat dich aus dem Raum genommen.'); stopNet(); mode='local'; G=null; render(); showMenu(); }
+  if(d.t==='deny'||d.t==='kicked'){ toast(str(d.msg,160)||'Der Gastgeber hat dich aus dem Raum genommen.'); leaveToMenu(); }
 }
-function showLost(){
+function clientAct(a){
+  const C=CLIENT; if(!C) return;
+  if(C.pending){ toast('Moment, der letzte Zug wird noch übertragen …'); return; }
+  const seq=++C.seq, msg={t:'act',a,seq};
+  C.pending={seq,msg,at:Date.now(),tries:0};
+  clientSendMsg(msg);
+}
+function showNotFound(){
   if(mode!=='client'||!CLIENT) return;
-  overlay(`<h2>Verbindung unterbrochen</h2><p>Die Verbindung zum Gastgeber ist weg. Vielleicht ist sein Bildschirm aus oder die App geschlossen.</p><div class="row"><button class="btn primary" id="reconnect">Neu verbinden</button><button class="btn" id="toMenu">Zum Menü</button></div>`,'lost');
+  overlay(`<h2>Raum nicht erreichbar</h2><p>Prüfe den Code. Der Gastgeber muss die App gerade geöffnet haben.</p><p class="note">Ich versuche es im Hintergrund weiter.</p><div class="row mt"><button class="btn primary" id="keepTrying">Weiter warten</button><button class="btn" id="toMenu">Zum Menü</button></div>`,'notfound');
 }
-function reconnect(){
-  if(!CLIENT) return; const code=CLIENT.code;
-  if(peer&&!peer.destroyed&&!peer.disconnected){ CLIENT.status='reconnecting'; overlay(`<h2>Verbinde neu …</h2>`,'wait'); connectToHost(); }
-  else joinGame(code);
-}
+function leaveToMenu(){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; render(); showMenu(); }
 
 /* Bildschirm wach halten, solange online gespielt wird */
 let wakeLock=null;
@@ -524,10 +702,12 @@ async function keepAwake(){ try{ if('wakeLock' in navigator && document.visibili
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState!=='visible') return;
   checkForUpdate();
-  if(mode!=='local') keepAwake();
-  if(peer&&!peer.destroyed&&peer.disconnected){ try{peer.reconnect();}catch(e){} }
-  if(mode==='client'&&CLIENT&&CLIENT.conn&&!CLIENT.conn.open&&!CLIENT.closedByUs) reconnect();
+  if(mode==='local') return;
+  keepAwake(); netKick();
+  if(mode==='host') hostBroadcast();
+  else if(CLIENT){ if(CLIENT.key) clientSendMsg({t:'ping'}); else clientHello(); }
 });
+window.addEventListener('online',()=>{ netKick(); });
 
 /* ---------- render ---------- */
 const ord=c=>c.k==='n'?c.n:c.k==='j'?20:30;
@@ -536,8 +716,8 @@ function toast(t){const h=$('toastHost'); h.innerHTML=`<div class="toast" role="
 
 function render(){
   const chip=$('netChip');
-  if(mode==='host'&&HOST){ chip.hidden=false; chip.className='netchip'; chip.textContent=`Gastgeber · ${HOST.code} · ${HOST.conns.size+1} online`; }
-  else if(mode==='client'&&CLIENT){ chip.hidden=false; const ok=CLIENT.conn&&CLIENT.conn.open; chip.className='netchip'+(ok?'':' bad'); chip.textContent=(ok?'Online · ':'Getrennt · ')+CLIENT.code; }
+  if(mode==='host'&&HOST){ const ok=netOnline(); chip.hidden=false; chip.className='netchip'+(ok?'':' bad'); chip.textContent=ok?`Gastgeber · ${fmtCode(HOST.code)} · ${onlineCount()+1} online`:'Kein Internet – verbinde neu …'; }
+  else if(mode==='client'&&CLIENT){ const ok=hostReachable(); chip.hidden=false; chip.className='netchip'+(ok?'':' bad'); chip.textContent=ok?'Online · '+fmtCode(CLIENT.code):(netOnline()?'Suche Gastgeber …':'Kein Internet – verbinde neu …'); }
   else chip.hidden=true;
   if(!G){
     $('roundInfo').textContent=''; $('players').innerHTML=''; $('center').hidden=true; $('dock').hidden=true; measureDock();
@@ -570,6 +750,8 @@ function render(){
   else if(G.stage==='draw'){msg='Du bist dran: Ziehe eine Karte.'; sub='Tippe auf den Stapel oder auf die Ablage.';}
   else if(!p.laid){msg='Etappe auslegen oder abwerfen.'; sub='Wähle die Karten für deine Etappe und tippe „Etappe auslegen“. Zum Beenden eine Karte wählen und abwerfen.';}
   else {msg='Anlegen oder abwerfen.'; sub='Wähle eine Karte und tippe auf eine gelb markierte Gruppe, um sie anzulegen.';}
+  if(mode==='client'&&!hostReachable()) sub='Verbindung zum Gastgeber unterbrochen – ich versuche es automatisch weiter …';
+  if(mode==='host'&&!netOnline()) sub='Keine Internetverbindung – ich verbinde automatisch neu …';
   $('msg').textContent=msg; $('sub').textContent=sub;
   $('log').innerHTML=G.log.slice(-8).reverse().map(t=>`<div>${esc(t)}</div>`).join('');
   const v=me!=null&&!covered?G.players[me]:null;
@@ -605,7 +787,7 @@ function stateOverlay(){
   if(!G) return;
   if(G.stage==='over'&&G.summary){
     const k='end'+G.round+(G.over?'x':'');
-    if(ovKey!==k && !['rules','menu','setup','lost','privacy'].includes(ovKey)) showRoundEnd(k);
+    if(ovKey!==k && !['rules','menu','setup','privacy'].includes(ovKey)) showRoundEnd(k);
   } else {
     if(ovKey.startsWith('end')) overlay('');
     if(mode==='local'&&covered&&!ovKey) showCover();
@@ -650,7 +832,7 @@ function showMenu(){
     <div><h3>Online – jeder an seinem Gerät</h3>
       <div class="row"><input type="text" id="nameIn" maxlength="16" placeholder="Dein Name" value="${esc(myName)}" aria-label="Dein Name" autocomplete="nickname"></div>
       <div class="row"><button class="btn primary" id="hostRoom">Neuen Raum erstellen</button>${sh?`<button class="btn" id="resumeHost">Raum ${esc(sh.code)} fortsetzen</button>`:''}</div>
-      <div class="row"><input type="text" id="codeIn" maxlength="${CODE_LEN}" placeholder="Raum-Code" value="${esc(last)}" aria-label="Raum-Code" autocapitalize="characters" autocomplete="off" spellcheck="false" class="codein"><button class="btn" id="joinRoom">Beitreten</button></div>
+      <div class="row"><input type="text" id="codeIn" maxlength="${CODE_LEN+1}" placeholder="ABCD-2345" value="${esc(last?fmtCode(last):'')}" aria-label="Raum-Code" autocapitalize="characters" autocomplete="off" spellcheck="false" class="codein"><button class="btn" id="joinRoom">Beitreten</button></div>
       <p class="note">Wer den Raum erstellt, ist Gastgeber. Sein Gerät muss während des Spiels online und an bleiben.</p>
     </div>
     <div><h3>An einem Gerät</h3><p class="note">Abwechselnd am selben Handy oder Tablet, auch mit Computergegnern.</p>
@@ -670,7 +852,8 @@ function showLobby(){
   else return;
   const list=seats.map((s,i)=>`<li><b>${esc(s.name)}</b><span>${s.ai?'Computer':s.host?'Gastgeber':''}${s.me?' · du':''}${s.off?' · offline':''}${isHost&&!s.me?` <button class="btn sm" data-kick="${i}">Entfernen</button>`:''}</span></li>`).join('');
   overlay(`<h2>Raum</h2><p>Gib nur deinen Mitspielern diesen Code. Sie öffnen die App, tippen auf „Beitreten“ und geben ihn ein.</p>
-    <div class="row"><span class="code">${esc(code)}</span><button class="btn" id="copyCode">Code kopieren</button></div>
+    <div class="row"><span class="code">${esc(fmtCode(code))}</span></div>
+    <div class="row"><button class="btn primary" id="shareInvite">Einladung teilen</button><button class="btn" id="copyCode">Code kopieren</button></div>
     <h3>Spieler (${seats.length}/6)</h3><ul class="seats">${list}</ul>
     ${isHost?'<p class="note">Unbekannte Namen kannst du mit „Entfernen“ wieder hinauswerfen.</p>':''}
     <div class="row mt">
@@ -715,9 +898,9 @@ function showPrivacy(){
   <p>Gespeichert werden nur: dein Name, eine zufällige Geräte-Kennung (damit du nach einem Verbindungsabbruch deinen Platz wiederbekommst), der letzte Raum-Code, deine Spiel-Einstellungen und – wenn du Gastgeber bist – der laufende Spielstand. Diese Daten verlassen dein Gerät nicht von selbst.</p>
   <h3>Beim Online-Spiel</h3>
   <ul>
-    <li>Damit sich die Geräte finden, wird der öffentliche Vermittlungsserver von PeerJS (0.peerjs.com) genutzt. Er sieht deine IP-Adresse und die Raum-Kennung, aber keine Spielzüge.</li>
-    <li>Zum Finden des Verbindungswegs werden ein STUN-Server von Google und, falls nötig, Weiterleitungs-Server von PeerJS genutzt. Auch diese sehen deine IP-Adresse.</li>
-    <li>Danach sind die Geräte direkt und verschlüsselt verbunden. Übertragen werden nur dein Name und deine Spielzüge. Deine Mitspieler können technisch deine IP-Adresse sehen.</li>
+    <li>Die Nachrichten laufen über zwei öffentliche Nachrichten-Server (MQTT): broker.hivemq.com (HiveMQ) und broker.emqx.io (EMQX). Sie sehen deine IP-Adresse und wann du online bist.</li>
+    <li>Alles, was übertragen wird, ist Ende-zu-Ende verschlüsselt (AES-256). Der Schlüssel entsteht aus dem Raum-Code, und jeder Mitspieler hat zusätzlich einen eigenen Schlüssel mit dem Gastgeber. Die Server und andere im Raum können deine Karten nicht lesen.</li>
+    <li>Übertragen werden nur dein Name und deine Spielzüge. Deine IP-Adresse sehen die Mitspieler nicht.</li>
     <li>Nur der Gastgeber kennt alle Karten. Alle anderen bekommen nur ihre eigene Hand.</li>
   </ul>
   <h3>Webseite</h3>
@@ -752,7 +935,7 @@ document.addEventListener('click',async e=>{
   const t=e.target.closest('[data-lo]')||e.target.closest('button'); if(!t) return;
   const id=t.id;
   if(id==='doUpdate'){
-    if(mode==='host'&&HOST&&HOST.conns.size){ hostSave(); }
+    if(mode==='host'&&HOST){ hostSave(); }
     reloading=true; const w=swReg&&swReg.waiting; if(w) w.postMessage('skipWaiting'); else location.reload(); return; }
   if(id==='laterUpdate'){ $('updateBar').hidden=true; return; }
   if(id==='btnRules'){ if(!ovKey||ovKey==='menu'||ovKey==='lobby'){ rulesReturn=ovKey; showRules(); } return; }
@@ -776,12 +959,19 @@ document.addEventListener('click',async e=>{
   if(id==='hostRoom'){ hostGame(null); return; }
   if(id==='resumeHost'){ const sh=savedHost(); if(sh) hostGame(sh); return; }
   if(id==='joinRoom'){ joinGame($('codeIn').value); return; }
-  if(id==='copyCode'){ const code=mode==='host'?HOST.code:CLIENT.code; try{ await navigator.clipboard.writeText(code); toast('Code kopiert.'); }catch(err){ toast('Code: '+code); } return; }
+  if(id==='copyCode'){ const code=fmtCode(mode==='host'?HOST.code:CLIENT.code); try{ await navigator.clipboard.writeText(code); toast('Code kopiert.'); }catch(err){ toast('Code: '+code); } return; }
+  if(id==='shareInvite'){
+    const code=mode==='host'?HOST.code:CLIENT.code;
+    const url=location.origin+location.pathname+'#raum-'+code;
+    const text=`Spiel Etappen-Rommé mit mir! Raum-Code: ${fmtCode(code)}`;
+    if(navigator.share){ try{ await navigator.share({title:'Etappen-Rommé',text,url}); }catch(err){} }
+    else { try{ await navigator.clipboard.writeText(text+'\n'+url); toast('Einladung kopiert – füge sie z. B. in WhatsApp ein.'); }catch(err){ toast('Code: '+fmtCode(code)); } }
+    return; }
+  if(id==='keepTrying'){ if(CLIENT){ CLIENT.start=Date.now(); } overlay(`<h2>Suche den Raum …</h2><p class="note">Sobald der Gastgeber online ist, geht es los.</p><div class="row"><button class="btn" id="toMenu">Abbrechen</button></div>`,'wait'); return; }
   if(id==='addBot'&&HOST){ if(HOST.seats.length<6){ const n=HOST.seats.filter(s=>s.ai).length+1; HOST.seats.push({tok:'bot-'+randHex(6),name:'Computer '+n,ai:true}); hostSave(); showLobby(); hostBroadcast(); } return; }
-  if(t.dataset.kick!=null&&HOST){ const k=int(t.dataset.kick,0,5,-1); const s=HOST.seats[k]; if(s&&s.tok!==myTok&&HOST.status==='lobby'){ HOST.seats.splice(k,1); HOST.conns.forEach(c=>{ if(c.tok===s.tok){ hostSend(c,{t:'kicked'}); setTimeout(()=>{try{c.close();}catch(_){}} ,300); HOST.conns.delete(c);} }); hostSave(); showLobby(); hostBroadcast(); } return; }
+  if(t.dataset.kick!=null&&HOST){ const k=int(t.dataset.kick,0,5,-1); const s=HOST.seats[k]; if(s&&s.tok!==myTok&&HOST.status==='lobby'){ HOST.seats.splice(k,1); HOST.clients.forEach((c,cid)=>{ if(c.tok===s.tok){ hostSend(c,{t:'kicked'}); HOST.clients.delete(cid);} }); hostSave(); showLobby(); hostBroadcast(); } return; }
   if(id==='startOnline'){ hostStart(); return; }
   if(id==='leaveRoom'||id==='toMenu'){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; render(); showMenu(); return; }
-  if(id==='reconnect'){ reconnect(); return; }
   if(id==='uncover'){covered=false; viewer=G.cur; overlay(''); render(); return;}
   if(id==='nextRound'){ if(mode!=='client'){ overlay(''); startRound(); changed(); } return; }
   if(id==='again'){ if(mode!=='client'){ overlay(''); G=newGameState(G.players.map(p=>({name:p.name,ai:p.ai,tok:p.tok}))); if(mode==='local'){const h=humans(); viewer=h.length===1?h[0]:null;} startRound(); changed(); } return; }
@@ -806,11 +996,11 @@ document.addEventListener('keydown',e=>{
   if(e.key==='Enter'&&e.target.id==='codeIn'){ $('joinRoom').click(); }
 });
 document.addEventListener('input',e=>{ if(e.target.id==='nameIn'){ myName=str(e.target.value,16); lsSet('etappen-name',myName);} });
-window.addEventListener('beforeunload',e=>{ if(mode==='host'&&HOST&&HOST.conns.size&&!reloading){ e.preventDefault(); e.returnValue=''; } });
+window.addEventListener('beforeunload',e=>{ if(mode==='host'&&HOST&&onlineCount()&&!reloading){ e.preventDefault(); e.returnValue=''; } });
 
 /* ---------- Start ---------- */
 render(); showMenu();
-const m=(location.hash||'').match(new RegExp('^#raum-(['+CODE_CHARS+']{'+CODE_LEN+'})$','i'));
-if(m){ const c=$('codeIn'); if(c) c.value=m[1].toUpperCase(); }
+const m=(location.hash||'').match(/^#raum-([A-Za-z0-9-]{8,9})$/);
+if(m&&CODE_RE.test(normCode(m[1]))){ const c=$('codeIn'); if(c) c.value=fmtCode(normCode(m[1])); toast('Einladung erkannt: Gib deinen Namen ein und tippe „Beitreten“.'); }
 setupSW();
 })();
