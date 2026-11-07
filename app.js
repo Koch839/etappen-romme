@@ -1,8 +1,8 @@
 /* Etappen-Rommé – Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.4.1';
-const PROTO=4;                      // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
+const APP_VERSION='1.5.0';
+const PROTO=5;                     // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
 const MAX_MSG_PER_SEC=25;
@@ -77,7 +77,8 @@ function sanitizeView(v){
 function sanitizeAction(a){
   if(!a||typeof a!=='object') return null;
   const type=str(a.type,10);
-  return {type, ids:Array.isArray(a.ids)?a.ids.slice(0,12).map(x=>int(x,0,1e6,-1)):[], id:int(a.id,0,1e6,-1), pi:int(a.pi,0,5,-1), gi:int(a.gi,0,2,-1), target:int(a.target,0,5,-1)};
+  return {type, ids:Array.isArray(a.ids)?a.ids.slice(0,12).map(x=>int(x,0,1e6,-1)):[],
+    groups:Array.isArray(a.groups)?a.groups.slice(0,3).map(g=>Array.isArray(g)?g.slice(0,12).map(x=>int(x,0,1e6,-1)):[]):null, id:int(a.id,0,1e6,-1), pi:int(a.pi,0,5,-1), gi:int(a.gi,0,2,-1), target:int(a.target,0,5,-1)};
 }
 
 /* ---------- state ----------
@@ -306,6 +307,38 @@ function drawDeck(){ if(!refill()){log('Keine Karten mehr – Zug ohne Ziehen.')
 function drawDisc(){ const top=G.disc[G.disc.length-1]; if(!top||top.k==='s') return null;
   G.disc.pop(); P().hand.push(top); G.stage='play'; log(`${P().name} nimmt ${desc(top)} von der Ablage.`); return top; }
 function desc(c){return c.k==='j'?'einen Joker':c.k==='s'?'Aussetzen':`${COLOR_NAMES[c.c]} ${c.n}`;}
+/* Etappe mit selbst zusammengestellten Gruppen auslegen – Gruppen dürfen größer sein als nötig */
+function layPhaseGroups(groups){
+  const p=P(), specs=PHASES[p.phase].g;
+  if(!Array.isArray(groups)||groups.length!==specs.length) return false;
+  const used=new Set(), res=[];
+  for(let gi=0;gi<specs.length;gi++){
+    const [type,n]=specs[gi], ids=groups[gi];
+    if(!Array.isArray(ids)||ids.length<n) return false;
+    const cards=[];
+    for(const id of ids){ if(used.has(id)) return false; const c=p.hand.find(x=>x.id===id); if(!c) return false; used.add(id); cards.push(c); }
+    const g=makeGroup(type,cards); if(!g) return false;
+    res.push(g);
+  }
+  p.hand=p.hand.filter(c=>!used.has(c.id)); p.laid=res;
+  const extra=used.size-specs.reduce((s,[,n])=>s+n,0);
+  log(`${p.name} legt Etappe ${p.phase+1} aus${extra>0?` (mit ${extra} Extra-Karte${extra>1?'n':''})`:''}!`); return true;
+}
+/* Für „Vorschlag“: Mindest-Gruppen finden und dann alle weiteren passenden Karten dazulegen */
+function suggestGroups(hand,specs){
+  const r=findPhase(hand,specs); if(!r) return null;
+  const used=new Set(r.flatMap(g=>g.cards.map(c=>c.id)));
+  let added=true;
+  while(added){
+    added=false;
+    for(const c of hand){
+      if(used.has(c.id)||c.k==='s') continue;
+      const g=r.find(g=>canAdd(g,c));
+      if(g){ addTo(g,c); used.add(c.id); added=true; }
+    }
+  }
+  return r.map(g=>g.cards.map(c=>c.id));
+}
 function layPhase(cards){
   const p=P(); const res=findPhase(cards,PHASES[p.phase].g); if(!res) return false;
   const used=new Set(res.flatMap(g=>g.cards.map(c=>c.id)));
@@ -353,8 +386,9 @@ function applyAction(seat,a){
     case 'take': if(G.stage!=='draw') return 'Du hast schon gezogen.'; return drawDisc()?null:'Aussetzen-Karten darf man nicht aufnehmen.';
     case 'lay': {
       if(G.stage!=='play') return 'Zieh zuerst eine Karte.'; if(p.laid) return 'Deine Etappe liegt schon.';
-      const cards=[...new Set(a.ids)].map(card).filter(Boolean);
-      if(!layPhase(cards)) return 'Die gewählten Karten ergeben noch nicht „'+PHASES[p.phase].t+'“.';
+      if(a.groups){ if(!layPhaseGroups(a.groups)) return 'Die Gruppen in der Vorablage passen noch nicht zu „'+PHASES[p.phase].t+'“.'; }
+      else { const cards=[...new Set(a.ids)].map(card).filter(Boolean);
+        if(!layPhase(cards)) return 'Die gewählten Karten ergeben noch nicht „'+PHASES[p.phase].t+'“.'; }
       checkOut(); return null; }
     case 'layoff': {
       if(G.stage!=='play') return 'Zieh zuerst eine Karte.'; if(!p.laid) return 'Lege zuerst deine Etappe aus.';
@@ -798,7 +832,7 @@ function stageFor(v,me){
 }
 function stageValid(v){
   const specs=PHASES[Math.min(v.phase,9)].g, byId=new Map(v.hand.map(c=>[c.id,c]));
-  return specs.map(([type,n],gi)=>{ const cards=(stage.groups[gi]||[]).map(id=>byId.get(id)).filter(Boolean); return cards.length===n&&!!makeGroup(type,cards); });
+  return specs.map(([type,n],gi)=>{ const cards=(stage.groups[gi]||[]).map(id=>byId.get(id)).filter(Boolean); return cards.length>=n&&!!makeGroup(type,cards); });
 }
 const stagedSet=()=>new Set(stage.groups.flat());
 
@@ -944,7 +978,7 @@ function render(){
       $('req').innerHTML=`<div class="stage">${ph.g.map(([type,n],gi)=>{
         const cards=st.groups[gi].map(id=>byId.get(id)).filter(Boolean);
         return `<div class="slot${st.active===gi?' on':''}${valid[gi]?' ok':''}" data-slot="${gi}" role="button" tabindex="0" aria-label="Vorablage ${GNAME[type](n)}">
-          <div class="slot-h"><span>${GNAME[type](n)}</span><b>${valid[gi]?'✓':cards.length+'/'+n}</b></div>
+          <div class="slot-h"><span>${GNAME[type](n)}</span><b>${valid[gi]?(cards.length>n?`✓ +${cards.length-n}`:'✓'):cards.length+'/'+n}</b></div>
           <div class="slot-cards">${cards.length?cards.map(c=>cardHTML(c,'st'+(c.id===justStaged?' new':''),`data-sid="${int(c.id,0,1e6,0)}"`)).join(''):`<span class="slot-empty">${st.active===gi?'Jetzt Karten antippen':'Antippen, dann Karten wählen'}</span>`}</div></div>`;}).join('')}</div>`;
     } else { $('req').innerHTML=''; stage.active=null; }
     for(const id of staged) sel.delete(id);
@@ -1167,7 +1201,7 @@ function showRules(){
   <p>Jeder versucht, nacheinander 10 Etappen zu schaffen. Jeder Spieler hat seine eigene Etappe. Jede Runde gibt es 10 Karten.</p>
   <ol>
     <li><b>Ziehen:</b> eine Karte vom Stapel oder die oberste der Ablage (Aussetzen-Karten nicht).</li>
-    <li><b>Auslegen:</b> Hast du alle Gruppen deiner Etappe, lege sie auf einmal aus. Tipp: In der <b>Vorablage</b> über deiner Hand kannst du die Gruppen schon vorher zusammenstellen – Feld antippen, dann Karten antippen. Ein grüner Haken zeigt, dass die Gruppe passt.</li>
+    <li><b>Auslegen:</b> Hast du alle Gruppen deiner Etappe, lege sie auf einmal aus. Tipp: In der <b>Vorablage</b> über deiner Hand kannst du die Gruppen schon vorher zusammenstellen – Feld antippen, dann Karten antippen. Ein grüner Haken zeigt, dass die Gruppe passt. <b>Gruppen dürfen größer sein als nötig</b> – statt zwei Drillingen kannst du z. B. zwei Vierlinge auslegen. Gehen dabei alle Karten weg, bist du sofort fertig.</li>
     <li><b>Anlegen:</b> Nur wer seine Etappe liegen hat, darf danach Karten an beliebige Gruppen anlegen.</li>
     <li><b>Abwerfen:</b> Jeder Zug endet mit einer Karte auf die Ablage.</li>
   </ol>
@@ -1291,9 +1325,15 @@ document.addEventListener('click',async e=>{
     const cid=+t.dataset.id;
     if(staging&&stage.active!=null){
       const specs=PHASES[Math.min(meP.phase,9)].g, gi=stage.active, n=specs[gi][1];
-      if(stage.groups[gi].length>=n){ toast('Dieses Feld ist schon voll.'); return; }
+      if(stage.groups[gi].length>=12){ toast('Mehr Karten passen nicht in eine Gruppe.'); return; }
       stage.groups[gi].push(cid); sel.delete(cid); justStaged=cid;
-      if(stage.groups[gi].length>=n){ const next=specs.findIndex(([,m],j)=>stage.groups[j].length<m); stage.active=next>=0?next:null; }
+      // Mindestzahl erreicht: im Feld bleiben, solange noch eine passende Karte auf der Hand ist – sonst zum nächsten Feld
+      if(stage.groups[gi].length>=n){
+        const byId=new Map(meP.hand.map(c=>[c.id,c])), staged=stagedSet();
+        const g=makeGroup(specs[gi][0],stage.groups[gi].map(id=>byId.get(id)).filter(Boolean));
+        const more=g&&meP.hand.some(c=>!staged.has(c.id)&&c.k==='n'&&canAdd(g,c));
+        if(!more){ const next=specs.findIndex(([,m],j)=>stage.groups[j].length<m); stage.active=next>=0?next:null; }
+      }
       render(); return;
     }
     sel.has(cid)?sel.delete(cid):sel.add(cid); render(); return;
@@ -1303,14 +1343,15 @@ document.addEventListener('click',async e=>{
   if(a==='clear'){sel.clear(); render(); return;}
   if(a==='unstage'&&staging){ stage.groups=stage.groups.map(()=>[]); stage.active=0; render(); return; }
   if(a==='hint'&&staging){
-    const r=findPhase(meP.hand,PHASES[meP.phase].g);
-    if(r){ stage.groups=r.map(g=>g.cards.map(c=>c.id)); stage.active=null; sel.clear(); toast('Vorablage gefüllt – diese Karten ergeben deine Etappe.'); }
+    const r=suggestGroups(meP.hand,PHASES[meP.phase].g);
+    if(r){ stage.groups=r; stage.active=null; sel.clear(); const left=meP.hand.length-r.flat().length;
+      toast(left===0?'Vorablage gefüllt – damit wirst du alle Karten los!':'Vorablage gefüllt – alle passenden Karten sind schon dabei.'); }
     else toast('Mit deiner Hand geht die Etappe noch nicht.');
     render(); return; }
   if(!mine||G.stage!=='play'||!meP) return;
   if(a==='lay'){
     if(!stageValid(meP).every(Boolean)){ toast('Fülle zuerst alle Felder der Vorablage passend.'); return; }
-    act({type:'lay',ids:stage.groups.flat()}); return; }
+    act({type:'lay',groups:stage.groups.map(g=>[...g])}); return; }
   if(a==='disc'){ const c=meP.hand.find(x=>sel.has(x.id)); if(!c) return; if(c.k==='s'){askSkip(c);return;} act({type:'discard',id:c.id}); return; }
   if(t.dataset.lo){ const [pi,gi]=t.dataset.lo.split(',').map(Number); const c=meP.hand.find(x=>sel.has(x.id)); if(c) act({type:'layoff',id:c.id,pi,gi}); return; }
 });
