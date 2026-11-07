@@ -1,22 +1,36 @@
-// Offline-Speicher für Etappen-Rommé. Bei Änderungen an der App die Versionsnummer erhöhen.
-const CACHE = 'etappen-v1';
+// Offline-Speicher und Updates für Etappen-Rommé.
+// Bei JEDER neuen Version die Versionsnummer erhöhen (und in app.js APP_VERSION).
+// Die App merkt die neue Version dann von selbst und bietet „Jetzt aktualisieren“ an.
+const VERSION = '1.1.0';
+const CACHE = 'etappen-' + VERSION;
 const ASSETS = [
   './',
   './index.html',
+  './app.js',
+  './app.css',
   './manifest.webmanifest',
+  './vendor/peerjs.min.js',
+  './fonts/bungee-latin.woff2',
+  './fonts/figtree-latin.woff2',
   './icons/icon-192.png',
   './icons/icon-512.png',
-  './icons/maskable-512.png',
-  'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js'
+  './icons/maskable-512.png'
 ];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  // Alles frisch vom Server holen (nicht aus dem HTTP-Cache), damit die Version zusammenpasst
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS.map(u => new Request(u, { cache: 'reload' })))));
+  // Kein skipWaiting hier: die neue Version wartet, bis der Nutzer „Jetzt aktualisieren“ tippt
+});
+
+self.addEventListener('message', e => {
+  if (e.data === 'skipWaiting') self.skipWaiting();
 });
 
 self.addEventListener('activate', e => {
   e.waitUntil(
-    caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
+    caches.keys()
+      .then(keys => Promise.all(keys.filter(k => k.startsWith('etappen-') && k !== CACHE).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -25,32 +39,19 @@ self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  // Verbindungsserver von PeerJS nie zwischenspeichern
-  if (url.hostname.endsWith('peerjs.com')) return;
+  if (url.origin !== self.location.origin) return;   // fremde Server nie anfassen
+  if (url.pathname.endsWith('/sw.js')) return;
 
-  // Seite selbst: zuerst Netz (für Updates), sonst Offline-Kopie
-  if (req.mode === 'navigate') {
-    e.respondWith(
-      fetch(req).then(res => {
-        const copy = res.clone();
-        caches.open(CACHE).then(c => c.put('./index.html', copy));
-        return res;
-      }).catch(() => caches.match('./index.html'))
-    );
-    return;
-  }
-
-  // Alles andere: sofort aus dem Speicher, im Hintergrund aktualisieren
-  e.respondWith(
-    caches.match(req).then(hit => {
-      const net = fetch(req).then(res => {
-        if (res && (res.ok || res.type === 'opaque')) {
-          const copy = res.clone();
-          caches.open(CACHE).then(c => c.put(req, copy));
-        }
-        return res;
-      }).catch(() => hit);
-      return hit || net;
-    })
-  );
+  e.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    const key = req.mode === 'navigate' ? './index.html' : req;
+    const hit = await cache.match(key, { ignoreSearch: true });
+    if (hit) return hit;
+    try {
+      return await fetch(req);
+    } catch (err) {
+      if (req.mode === 'navigate') return cache.match('./index.html');
+      throw err;
+    }
+  })());
 });
