@@ -1,7 +1,7 @@
 /* Spielhafen – Etappen-Rommé & Schiffe versenken: Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.8.1';
+const APP_VERSION='1.9.1';
 const PROTO=8;                  // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
@@ -115,15 +115,40 @@ function cardHTML(c,cls='',attrs=''){
 }
 
 /* ---------- Charaktere (eigene Figuren, alles selbst gezeichnet) ---------- */
-const AV_PARTS={b:8,c:10,e:7,m:6,h:10,g:8};
-const AV_ORDER=['b','c','e','m','h','g'];
-const AV_LABEL={b:'Figur',c:'Farbe',e:'Augen',m:'Mund',h:'Extra',g:'Hintergrund'};
+const AV_PARTS={b:8,c:10,e:7,m:6,h:10,g:8,k:8};
+const AV_ORDER=['b','c','e','m','h','g','k'];
+const AV_LABEL={b:'Figur',c:'Farbe',e:'Augen',m:'Mund',h:'Extra',g:'Hintergrund',k:'Kartenrücken'};
 const AV_NAMES={b:['Blob','Katze','Bär','Roboter','Geist','Monster','Frosch','Pinguin'],
   c:['Rot','Orange','Gelb','Grün','Türkis','Blau','Indigo','Lila','Rosa','Grau'],
   e:['Kulleraugen','Fröhlich','Müde','Sterne','Sonnenbrille','Zwinkern','Staunen'],
   m:['Lächeln','Grinsen','Oh!','Zunge','Ernst','Vampir'],
   h:['Nichts','Krone','Partyhut','Kappe','Kopfhörer','Schleife','Zauberhut','Hörner','Blume','Heiligenschein'],
-  g:['Nachtblau','Wald','Beere','Kirsche','Kürbis','Lagune','Schiefer','Wolke']};
+  g:['Nachtblau','Wald','Beere','Kirsche','Kürbis','Lagune','Schiefer','Wolke'],
+  k:['Spieltisch','Kirsche','Ozean','Galaxie','Gold','Carbon','Regenbogen','Bonbon']};
+/* Kartenrücken im eigenen Design (andere sehen deine Karten so) */
+const backOf=(av,cls='')=>`<div class="card back bk${int(av&&av.k,0,7,0)} ${cls}"></div>`;
+/* Fächer aus Rückseiten – zeigt, wie viele Karten jemand hat */
+function backFanHTML(n,av){
+  const shown=Math.min(n,10);
+  return `<div class="bfan" data-n="${shown}">${Array.from({length:shown},()=>backOf(av,'fc')).join('')}<span class="bcnt">${n}</span></div>`;
+}
+/* Sitzplätze im Halbkreis um den Tisch anordnen und die Fächer auffächern (per CSSOM, ohne Inline-Styles) */
+function layoutTable(root){
+  if(!root) return;
+  root.querySelectorAll('.seat.me').forEach(el=>{ el.style.left='50%'; el.style.top='100%'; });
+  const seats=[...root.querySelectorAll('.seat:not(.me)')], m=seats.length;
+  seats.forEach((el,i)=>{
+    const a=(m===1?270:(m===2?[215,325][i]:200+i*(140/(m-1))))*Math.PI/180;
+    el.style.left=(50+44*Math.cos(a)).toFixed(1)+'%';
+    el.style.top=(56+47*Math.sin(a)).toFixed(1)+'%';
+  });
+  root.querySelectorAll('.bfan').forEach(f=>{
+    const cs=[...f.querySelectorAll('.fc')], k=cs.length, step=k>1?Math.min(11,70/(k-1)):0;
+    cs.forEach((c,i)=>{ const o=i-(k-1)/2; c.style.transform=`translateX(${(o*7).toFixed(1)}px) rotate(${(o*step).toFixed(1)}deg)`; c.style.zIndex=i; });
+  });
+}
+/* Reihenfolge der Gegner: der nächste Spieler sitzt links, dann im Uhrzeigersinn */
+function opponents(n,me){ const out=[]; for(let k=1;k<=n;k++){ const i=me==null?k-1:(me+k)%n; if(i!==me) out.push(i); } return me==null?out.slice(0,n):out; }
 const AV_BODY=['#ff6b6b','#ffa94d','#ffd43b','#69db7c','#38d9a9','#4dabf7','#748ffc','#da77f2','#f783ac','#ced4da'];
 const AV_BG=['#1e3a5f','#2b8a3e','#862e9c','#c92a2a','#e67700','#0b7285','#343a40','#dbe4ff'];
 function cleanAv(a){ a=a&&typeof a==='object'?a:{}; const o={}; for(const k of AV_ORDER) o[k]=int(a[k],0,AV_PARTS[k]-1,0); return o; }
@@ -886,7 +911,7 @@ function captureRects(){
   const r={hand:{},pl:{},deck:null,disc:null};
   document.querySelectorAll('#hand .card[data-id]').forEach(el=>{ r.hand[el.dataset.id]=el.getBoundingClientRect(); });
   document.querySelectorAll('#req [data-sid]').forEach(el=>{ r.hand[el.dataset.sid]=el.getBoundingClientRect(); });
-  document.querySelectorAll('.pl[data-pl]').forEach(el=>{ r.pl[el.dataset.pl]=rectOf(el.querySelector('svg.av')||el); });
+  document.querySelectorAll('#seatsR [data-pl]').forEach(el=>{ r.pl[el.dataset.pl]=rectOf(el.querySelector('svg.av')||el); });
   if(!$('center').hidden){ r.deck=rectOf($('deckSlot').firstElementChild); r.disc=rectOf($('discSlot').firstElementChild); }
   return r;
 }
@@ -928,8 +953,8 @@ function runAnims(prev,now,before){
   }
   now.counts.forEach((n,i)=>{
     if(i===now.me||n<=prev.counts[i]) return;
-    const t=rectOf(document.querySelector(`.pl[data-pl="${i}"] svg.av`));
-    if(t) fly(backHTML(), tookDisc&&prev.cur===i?discR:deckR, t, {dur:420, fade:true});
+    const t=rectOf(document.querySelector(`#seatsR [data-pl="${i}"] .bfan`)||document.querySelector(`#seatsR [data-pl="${i}"] svg.av`));
+    if(t) fly(backOf(G.players[i].av), tookDisc&&prev.cur===i?discR:deckR, t, {dur:420, fade:true});
   });
   if(now.cur!==prev.cur&&myTurn()&&G.stage==='draw') showTurnBanner();
 }
@@ -941,7 +966,7 @@ function deal(now){
   for(let r=0;r<10;r++) for(let k=0;k<n;k++){
     const i=(G.dealer+1+k)%n, delay=(r*n+k)*step;
     if(i===now.me){ const el=mineEls[r]; if(!el) continue; const id=+el.dataset.id; fly(backHTML(), src, el.getBoundingClientRect(), {delay, dur:340, done:()=>reveal(id)}); }
-    else { const t=rectOf(document.querySelector(`.pl[data-pl="${i}"] svg.av`)); if(t) fly(backHTML(), src, t, {delay, dur:340, fade:true}); }
+    else { const t=rectOf(document.querySelector(`#seatsR [data-pl="${i}"] .bfan`)||document.querySelector(`#seatsR [data-pl="${i}"] svg.av`)); if(t) fly(backOf(G.players[i].av), src, t, {delay, dur:340, fade:true}); }
   }
   const d=$('discSlot').firstElementChild;
   if(d&&G.disc.length){ discIncoming=true; d.classList.add('incoming'); fly(cardHTML(G.disc[G.disc.length-1]), src, d.getBoundingClientRect(), {delay:10*n*step, dur:380, done:revealDisc}); }
@@ -1523,7 +1548,15 @@ function renderMM(){
   const mine=V.phase==='play'&&V.cur===me&&me!=null&&!covered;
   const R=V.rules, top=V.disc[V.disc.length-1];
   $('roundInfo').textContent=`Mau-Mau · Runde ${V.round}`;
-  $('mmPlayers').innerHTML=V.players.map((p,i)=>`<div class="pl${V.phase==='play'&&V.cur===i?' cur':''}"><div class="pl-top"><div class="pl-who">${avatarSVG(p.av,40)}<div class="pl-name">${esc(p.name)}${p.ai?' <span class="pl-meta">· Computer</span>':''}${i===me&&mode!=='local'?' <span class="pl-meta">· du</span>':''}</div></div><div class="pl-meta">${p.n} Karte${p.n===1?'':'n'} · ${p.wins} Sieg${p.wins===1?'':'e'}</div></div>${p.n===1&&V.phase==='play'?'<div class="mau-badge">Mau!</div>':''}</div>`).join('');
+  const meVisible=me!=null&&!covered;
+  const seatHTML=i=>{ const p=V.players[i], isMe=meVisible&&i===me;
+    return `<div class="seat${isMe?' me':''}${V.phase==='play'&&V.cur===i?' cur':''}" data-pl="${i}">
+      ${isMe?'':backFanHTML(p.n,p.av)}
+      <div class="seat-who">${avatarSVG(p.av,isMe?36:40)}<div class="seat-txt"><b>${esc(p.name)}${isMe&&mode!=='local'?' · du':''}</b><small>${p.wins} Sieg${p.wins===1?'':'e'}${p.ai?' · Computer':''}</small></div></div>
+      ${p.n===1&&V.phase==='play'?'<div class="mau-badge">Mau!</div>':''}
+    </div>`; };
+  $('mmSeats').innerHTML=opponents(V.players.length,meVisible?me:null).map(seatHTML).join('')+(meVisible?seatHTML(me):'');
+  layoutTable($('tableM'));
   $('mmDeck').innerHTML=`<button class="card big back${mine&&V.drawn==null?' can':''}" id="mmDeckBtn" aria-label="Karte ziehen"></button>`;
   $('mmDeckN').textContent=`Stapel · ${V.deckN}`;
   $('mmDisc').innerHTML=mmCardHTML(top,'big land','id="mmTop" tabindex="-1"');
@@ -1623,21 +1656,21 @@ function render(){
   else if(mode==='client'&&CLIENT){ const ok=hostReachable(); chip.hidden=false; chip.className='netchip'+(ok?'':' bad'); chip.textContent=ok?'Online · '+fmtCode(CLIENT.code):(netOnline()?'Suche Gastgeber …':'Kein Internet – verbinde neu …'); }
   else chip.hidden=true;
   if(mmActive()){
-    $('players').innerHTML=''; $('center').hidden=true; $('board').hidden=true; $('sv').hidden=true; $('mm').hidden=false; $('dock').hidden=false;
+    $('players').innerHTML=''; $('board').hidden=true; $('sv').hidden=true; $('mm').hidden=false; $('dock').hidden=false;
     prevSnap=null; renderMM(); measureDock(); return;
   }
   $('mm').hidden=true; mmPrevCur=null;
   if(svActive()){
-    $('players').innerHTML=''; $('center').hidden=true; $('dock').hidden=true; $('board').hidden=true; $('sv').hidden=false; measureDock();
+    $('players').innerHTML=''; $('dock').hidden=true; $('board').hidden=true; $('sv').hidden=false; measureDock();
     prevSnap=null; renderSV(); return;
   }
   $('sv').hidden=true; $('board').hidden=false; svPrevCur=null;
   if(!G){
-    $('roundInfo').textContent=''; $('players').innerHTML=''; $('center').hidden=true; $('dock').hidden=true; measureDock();
+    $('roundInfo').textContent=''; $('players').innerHTML=''; $('seatsR').innerHTML=''; $('tableR').hidden=true; $('statusR').hidden=true; $('center').hidden=true; $('dock').hidden=true; measureDock();
     prevSnap=null; incoming.clear(); discIncoming=false;
     return;
   }
-  $('center').hidden=false; $('dock').hidden=false;
+  $('center').hidden=false; $('dock').hidden=false; $('tableR').hidden=false; $('statusR').hidden=false;
   const me=mySeat();
   $('roundInfo').textContent=`Runde ${G.round}`;
   const p=P(); const mine=myTurn();
@@ -1646,13 +1679,20 @@ function render(){
   const selCard=oneSel&&meP?meP.hand.find(c=>c.id===oneSel):null;
   const canLayOff=mine && G.stage==='play' && p.laid && selCard;
   const sameRound=prev&&prev.round===G.round;
-  $('players').innerHTML=G.players.map((pl,i)=>`
-    <div class="pl ${i===G.cur&&G.stage!=='over'?'cur':''}" data-pl="${i}">
-      <div class="pl-top"><div class="pl-who">${avatarSVG(pl.av,40)}<div class="pl-name">${esc(pl.name)}${pl.ai?' <span class="pl-meta">· Computer</span>':''}${mode!=='local'&&i===me?' <span class="pl-meta">· du</span>':''}${pl.off?'<span class="badge off">offline</span>':''}${pl.skip?`<span class="badge">setzt aus</span>`:''}${pl.laid?`<span class="badge ok">ausgelegt</span>`:''}</div></div>
-      <div class="pl-meta">${int(pl.hand.length,0,999,0)} Karten · ${int(pl.score,0,1e6,0)} Pkt.</div></div>
-      <div class="pl-phase">Etappe <b>${Math.min(int(pl.phase,0,10,0)+1,10)}</b> · ${PHASES[Math.min(int(pl.phase,0,10,0),9)].t}</div>
-      ${pl.laid?`<div class="groups">${pl.laid.map((g,gi)=>{const t=canLayOff&&canAdd(g,selCard); return `<div class="grp ${t?'target':''}" ${t?`data-lo="${i},${gi}" tabindex="0" role="button" aria-label="Hier anlegen"`:''}>${g.cards.map(c=>cardHTML(c,'mini'+(sameRound&&!prev.laidIds.has(c.id)?' pop':''),'tabindex="-1"')).join('')}</div>`;}).join('')}</div>`:''}
-    </div>`).join('');
+  // Plätze am Tisch: Gegner im Halbkreis (mit Karten-Fächer), ich unten
+  const meVisible=me!=null&&!covered;
+  const seatHTML=i=>{ const pl=G.players[i], isMe=meVisible&&i===me;
+    return `<div class="seat${isMe?' me':''}${i===G.cur&&G.stage!=='over'?' cur':''}" data-pl="${i}">
+      ${isMe?'':backFanHTML(int(pl.hand.length,0,999,0),pl.av)}
+      <div class="seat-who">${avatarSVG(pl.av,isMe?36:40)}<div class="seat-txt"><b>${esc(pl.name)}${isMe&&mode!=='local'?' · du':''}</b><small>Etappe ${Math.min(int(pl.phase,0,10,0)+1,10)} · ${int(pl.score,0,1e6,0)} Pkt.</small></div></div>
+      <div class="seat-badges">${pl.ai?'<span class="badge">Computer</span>':''}${pl.off?'<span class="badge off">offline</span>':''}${pl.skip?'<span class="badge">setzt aus</span>':''}${pl.laid?'<span class="badge ok">ausgelegt</span>':''}</div>
+    </div>`; };
+  $('seatsR').innerHTML=opponents(G.players.length,meVisible?me:null).map(seatHTML).join('')+(meVisible?seatHTML(me):'');
+  layoutTable($('tableR'));
+  // Ausgelegte Etappen unter dem Tisch
+  const laidRows=G.players.map((pl,i)=>pl.laid?`<div class="laid-row"><span class="who">${avatarSVG(pl.av,26)}<b>${esc(pl.name)}</b><small class="pl-meta">Etappe ${Math.min(int(pl.phase,0,10,0)+1,10)}: ${PHASES[Math.min(int(pl.phase,0,10,0),9)].t}</small></span>
+      <div class="groups">${pl.laid.map((g,gi)=>{const t=canLayOff&&canAdd(g,selCard); return `<div class="grp ${t?'target':''}" ${t?`data-lo="${i},${gi}" tabindex="0" role="button" aria-label="Hier anlegen"`:''}>${g.cards.map(c=>cardHTML(c,'mini'+(sameRound&&!prev.laidIds.has(c.id)?' pop':''),'tabindex="-1"')).join('')}</div>`;}).join('')}</div></div>`:'').join('');
+  $('players').innerHTML=laidRows?`<h3 class="laid-h">Ausgelegt</h3>${laidRows}`:'';
   const top=G.disc[G.disc.length-1];
   const deckN=G.deckN!=null?G.deckN:G.deck.length;
   const drawOK=mine&&G.stage==='draw';
@@ -1891,7 +1931,7 @@ function showAvatarEditor(ret){
   if(!avDraft) avDraft={...myAv};
   overlay(`<h2>Dein Charakter</h2>
     <div class="av-edit">
-      <div class="av-big">${avatarSVG(avDraft,150,'av av-xl wiggle')}</div>
+      <div class="av-big">${avatarSVG(avDraft,150,'av av-xl wiggle')}<div class="back-prev">${backOf(avDraft,'')}${backOf(avDraft,'')}<small>So sehen andere deine Karten</small></div></div>
       <div class="av-rows">${AV_ORDER.map(k=>`<div class="av-row"><span class="av-lbl">${AV_LABEL[k]}</span><button class="btn sq" data-av="${k},-1" aria-label="${AV_LABEL[k]}: vorherige">‹</button><span class="av-val">${AV_NAMES[k][avDraft[k]]}</span><button class="btn sq" data-av="${k},1" aria-label="${AV_LABEL[k]}: nächste">›</button></div>`).join('')}</div>
     </div>
     <div class="row mt"><button class="btn" id="avRandom">Zufall</button><button class="btn primary" id="avSave">Fertig</button><button class="btn" id="avCancel">Abbrechen</button></div>`,'avatar');

@@ -38,20 +38,25 @@
     <div class="sv-ctrl" id="svCtrl"></div>
   </div>
   <div class="mm" id="mm" hidden>
-    <div class="players" id="mmPlayers"></div>
-    <div class="center">
-      <div class="pile"><div id="mmDeck"></div><span id="mmDeckN">Stapel</span></div>
-      <div class="pile"><div id="mmDisc"></div><span id="mmInfo"></span></div>
-      <div class="status"><div class="msg" id="mmMsg"></div><div class="sub" id="mmSub"></div><div class="log" id="mmLog"></div></div>
+    <div class="tabletop" id="tableM">
+      <div class="felt"><div class="center felt-center">
+        <div class="pile"><div id="mmDeck"></div><span id="mmDeckN">Stapel</span></div>
+        <div class="pile"><div id="mmDisc"></div><span id="mmInfo"></span></div>
+      </div></div>
+      <div class="seats" id="mmSeats"></div>
     </div>
+    <div class="status table-status"><div class="msg" id="mmMsg"></div><div class="sub" id="mmSub"></div><div class="log" id="mmLog"></div></div>
   </div>
   <div class="board" id="board">
-    <div class="players" id="players"></div>
-    <div class="center" id="center">
-      <div class="pile"><div id="deckSlot"></div><span id="deckCount">Stapel</span></div>
-      <div class="pile"><div id="discSlot"></div><span>Ablage</span></div>
-      <div class="status"><div class="msg" id="msg"></div><div class="sub" id="sub"></div><div class="log" id="log"></div></div>
+    <div class="tabletop" id="tableR">
+      <div class="felt"><div class="center felt-center" id="center">
+        <div class="pile"><div id="deckSlot"></div><span id="deckCount">Stapel</span></div>
+        <div class="pile"><div id="discSlot"></div><span>Ablage</span></div>
+      </div></div>
+      <div class="seats" id="seatsR"></div>
     </div>
+    <div class="status table-status" id="statusR"><div class="msg" id="msg"></div><div class="sub" id="sub"></div><div class="log" id="log"></div></div>
+    <div class="laid-list" id="players"></div>
   </div>
 </div>
 
@@ -66,6 +71,6 @@
 <div id="updateBar" role="status" hidden></div>
 <div id="fx" aria-hidden="true"></div>
 <div id="turnBanner" role="status" hidden></div>
-<noscript><p>Etappen-Rommé braucht JavaScript.</p></noscript>
+<noscript><p>Spielhafen braucht JavaScript.</p></noscript>
 </body>
 </html>
