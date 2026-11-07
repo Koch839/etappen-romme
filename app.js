@@ -1,7 +1,7 @@
 /* Etappen-Rommé – Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.3.2';
+const APP_VERSION='1.4.0';
 const PROTO=4;                      // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
@@ -28,7 +28,7 @@ const PHASES=[
 const GNAME={set:n=>({2:'Zwilling',3:'Drilling',4:'Vierling',5:'Fünfling'}[n]||n+' Gleiche'), run:n=>'Folge von '+n, color:n=>n+' einer Farbe'};
 const $=id=>document.getElementById(id);
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-const LS_KEYS=['etappen-name','etappen-token','etappen-setup','etappen-host','etappen-last','etappen-avatar'];
+const LS_KEYS=['etappen-name','etappen-token','etappen-setup','etappen-host','etappen-last','etappen-avatar','etappen-theme','etappen-anim'];
 const lsGet=k=>{try{return localStorage.getItem(k);}catch(e){return null;}};
 const lsSet=(k,v)=>{try{localStorage.setItem(k,v);}catch(e){}};
 const lsDel=k=>{try{localStorage.removeItem(k);}catch(e){}};
@@ -402,7 +402,7 @@ async function runAI(){
   const wait=async ms=>{await sleep(ms); if(stale()) throw 'stale';};
   const step=()=>{ if(mode==='host'){hostBroadcast();} render(); };
   try{
-    const dealWait=(G.log.length<=1&&!reduceMotion.matches)?10*G.players.length*55+500:0;   // erst austeilen lassen
+    const dealWait=(G.log.length<=1&&!reduceMotion.matches&&!animOff)?10*G.players.length*55+500:0;   // erst austeilen lassen
     await wait(delay+dealWait);
     const top=G.disc[G.disc.length-1];
     let take=false;
@@ -840,7 +840,7 @@ function reveal(id){ incoming.delete(id); const el=handEl(id); if(el){ el.classL
 function revealDisc(){ discIncoming=false; const d=$('discSlot').firstElementChild; if(d){ d.classList.remove('incoming'); d.classList.add('land'); } }
 function hideIncoming(el,id){ incoming.add(id); el.classList.add('incoming'); }
 function runAnims(prev,now,before){
-  if(!now||reduceMotion.matches||document.hidden) return;
+  if(!now||reduceMotion.matches||animOff||document.hidden) return;
   if(!prev){ if(G.log.length<=1&&G.stage!=='over') deal(now); return; }   // frisch ausgeteilt
   const deckEl=$('deckSlot').firstElementChild, discEl=$('discSlot').firstElementChild;
   const deckR=before.deck||rectOf(deckEl), discR=before.disc||rectOf(discEl);
@@ -972,12 +972,12 @@ if(window.ResizeObserver) new ResizeObserver(measureDock).observe($('dock'));
 window.addEventListener('resize',measureDock);
 
 /* ---------- overlays ---------- */
-function overlay(html,key){ ovKey=html?(key||'misc'):''; $('overlay').innerHTML=html?`<div class="ov"><div class="box">${html}</div></div>`:''; }
+function overlay(html,key,cls){ ovKey=html?(key||'misc'):''; $('overlay').innerHTML=html?`<div class="ov${cls?' '+cls:''}"><div class="box">${html}</div></div>`:''; const b=$('overlay').querySelector('.box'); if(b) b.scrollTop=0; }
 function stateOverlay(){
   if(!G) return;
   if(G.stage==='over'&&G.summary){
     const k='end'+G.round+(G.over?'x':'');
-    if(ovKey!==k && !['rules','menu','setup','privacy'].includes(ovKey)) showRoundEnd(k);
+    if(ovKey!==k && !['rules','menu','setup','privacy','online','settings','avatar'].includes(ovKey)) showRoundEnd(k);
   } else {
     if(ovKey.startsWith('end')) overlay('');
     if(mode==='local'&&covered&&!ovKey) showCover();
@@ -1010,34 +1010,102 @@ let installEvt=null;
 window.addEventListener('beforeinstallprompt',e=>{ e.preventDefault(); installEvt=e; if(ovKey==='menu') showMenu(); });
 const standalone=()=>window.matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;
 const isIOS=/iphone|ipad|ipod/i.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+/* ---------- Hintergründe & Einstellungen ---------- */
+const THEMES={
+  auto:{name:'Automatisch'},
+  filz:{name:'Spieltisch',dark:1,table:'#0f2a20',table2:'#0b211a',panel:'#163629',fg:'#e7f2ec',muted:'#9db7aa',line:'#2b5444',accent:'#3fc28a',accentFg:'#05140e',hl:'#ffd24a'},
+  ozean:{name:'Ozean',dark:1,table:'#0d3358',table2:'#071a30',panel:'#12365c',fg:'#e6f0fb',muted:'#9fb6cf',line:'#24507c',accent:'#4dabf7',accentFg:'#04121f',hl:'#ffd24a'},
+  nacht:{name:'Galaxie',dark:1,table:'#2a1a4a',table2:'#100a1f',panel:'#2a1e47',fg:'#efe9fb',muted:'#b3a6cf',line:'#44356b',accent:'#b197fc',accentFg:'#140b26',hl:'#ffd24a'},
+  kirsche:{name:'Kirsche',dark:1,table:'#4a121d',table2:'#22070c',panel:'#4d1620',fg:'#fbe9ec',muted:'#d6a3ab',line:'#6e2a35',accent:'#ff8787',accentFg:'#2a0509',hl:'#ffd43b'},
+  sonne:{name:'Sonnenuntergang',dark:1,table:'#6b2a4f',table2:'#1f0d2e',panel:'#3d1a3a',fg:'#fdeef4',muted:'#e0aecb',line:'#6b2e5e',accent:'#ff922b',accentFg:'#2a0f00',hl:'#ffe066'},
+  schwarz:{name:'Mitternacht',dark:1,table:'#1b1e23',table2:'#08090b',panel:'#1c1f24',fg:'#eceff3',muted:'#9aa3ad',line:'#2e333a',accent:'#63e6be',accentFg:'#04140f',hl:'#ffd43b'},
+  sand:{name:'Sand',dark:0,table:'#f3e9d2',table2:'#e3d0a8',panel:'#fffaf0',fg:'#2b2216',muted:'#7a6a52',line:'#d8c49c',accent:'#b5651d',accentFg:'#ffffff',hl:'#e8590c'},
+  minze:{name:'Minze',dark:0,table:'#dff5ec',table2:'#bfe8d6',panel:'#f6fffb',fg:'#12302a',muted:'#4f756b',line:'#a6d8c4',accent:'#0b8f68',accentFg:'#ffffff',hl:'#f59f00'},
+  bonbon:{name:'Bonbon',dark:0,table:'#fde2f0',table2:'#f3c4dd',panel:'#fff6fb',fg:'#3a1630',muted:'#86587a',line:'#efbcd8',accent:'#c2255c',accentFg:'#ffffff',hl:'#f59f00'}
+};
+const THEME_VARS={table:'--table',table2:'--table-2',panel:'--panel',fg:'--fg',muted:'--muted',line:'--line',accent:'--accent',accentFg:'--accent-fg',hl:'--hl'};
+let themeKey=THEMES[lsGet('etappen-theme')]?lsGet('etappen-theme'):'auto';
+let animOff=lsGet('etappen-anim')==='off';
+function applyTheme(){
+  const r=document.documentElement.style, t=THEMES[themeKey];
+  for(const k in THEME_VARS){ if(t&&t[k]) r.setProperty(THEME_VARS[k],t[k]); else r.removeProperty(THEME_VARS[k]); }
+  if(t&&t.table){ r.setProperty('color-scheme',t.dark?'dark':'light'); } else r.removeProperty('color-scheme');
+  const meta=document.querySelector('meta[name="theme-color"]'); if(meta) meta.setAttribute('content',(t&&t.table2)||'#0f2a20');
+  document.documentElement.classList.toggle('no-anim',animOff);
+}
+applyTheme();
+
+/* ---------- Hauptmenü ---------- */
+const decoCard=(c,cls)=>cardHTML(c,cls).replace(/^<button/,'<div').replace(/<\/button>$/,'</div>');
+function installBlock(){
+  if(standalone()) return '';
+  if(installEvt) return `<button class="hlink" id="install">App installieren</button>`;
+  if(isIOS) return `<span class="hnote">Als App: Teilen → „Zum Home-Bildschirm“</span>`;
+  return '';
+}
 function showMenu(){
+  const nameEl=$('nameIn'); if(nameEl) myName=str(nameEl.value,16);
+  const fan=[{k:'n',n:1,c:0},{k:'n',n:7,c:1},{k:'j'},{k:'n',n:12,c:3},{k:'n',n:5,c:2}];
+  overlay(`<div class="home">
+    <div class="home-hero">
+      <div class="fan" aria-hidden="true">${fan.map((c,i)=>decoCard(c,'fan-'+i)).join('')}</div>
+      <h1 class="logo">Etappen<span>Rommé</span></h1>
+      <p class="tag">10 Etappen. Wer schafft sie zuerst?</p>
+    </div>
+    <div class="home-profile">
+      <button class="av-btn" id="editAv" aria-label="Charakter bearbeiten">${avatarSVG(myAv,76)}<span>Bearbeiten</span></button>
+      <div class="profile-in"><label class="note" for="nameIn">Dein Name</label><input type="text" id="nameIn" maxlength="16" placeholder="Wie heißt du?" value="${esc(myName)}" autocomplete="nickname"></div>
+    </div>
+    <div class="home-btns">
+      ${G?`<button class="hbtn go" id="closeOv"><b>Weiterspielen</b><small>Zurück zum laufenden Spiel</small></button>`:''}
+      <button class="hbtn go" id="goOnline"><b>Online spielen</b><small>Jeder an seinem eigenen Gerät</small></button>
+      <button class="hbtn" id="localSetup"><b>An einem Gerät</b><small>Mit Freunden oder gegen den Computer</small></button>
+      <button class="hbtn" id="goSettings"><b>Einstellungen</b><small>Hintergrund und Animationen</small></button>
+    </div>
+    <div class="home-foot">
+      <button class="hlink" id="showRules2">Regeln</button>
+      <button class="hlink" id="showPrivacy">Datenschutz</button>
+      ${G?'<button class="hlink" id="toMenu">Spiel beenden</button>':''}
+      ${installBlock()}
+      <span class="hnote">Version ${APP_VERSION}</span>
+    </div>
+  </div>`,'menu','full');
+}
+function showOnline(){
+  readName();
   const sh=savedHost();
   const lastRaw=normCode(lsGet('etappen-last'));
   const typed=$('codeIn')?normCode($('codeIn').value):'';
   const last=typed||inviteCode||(CODE_RE.test(lastRaw)?lastRaw:'');
-  const nameEl=$('nameIn'); if(nameEl) myName=str(nameEl.value,16);
-  let inst='';
-  if(!standalone()){
-    if(installEvt) inst=`<div><h3>Als App installieren</h3><p class="note">Legt Etappen-Rommé als App auf deinen Startbildschirm.</p><div class="row"><button class="btn primary" id="install">App installieren</button></div></div>`;
-    else if(isIOS) inst=`<div><h3>Als App installieren</h3><p class="note">Tippe in Safari unten auf <b>Teilen</b> und dann auf <b>„Zum Home-Bildschirm“</b>.</p></div>`;
-  }
-  overlay(`<h2>Etappen-Rommé</h2><p>Sammle Drillinge, Folgen und Farben und schaffe als Erster alle 10 Etappen.</p>
-  <div class="profile">
-    <button class="av-btn" id="editAv" aria-label="Charakter bearbeiten">${avatarSVG(myAv,72)}<span>Bearbeiten</span></button>
-    <div class="profile-in"><label class="note" for="nameIn">Dein Name</label><input type="text" id="nameIn" maxlength="16" placeholder="Dein Name" value="${esc(myName)}" autocomplete="nickname"></div>
-  </div>
-  <div class="choice">
-    <div><h3>Online – jeder an seinem Gerät</h3>
-      <div class="row"><button class="btn primary" id="hostRoom">Neuen Raum erstellen</button>${sh?`<button class="btn" id="resumeHost">Raum ${esc(fmtCode(sh.code))} fortsetzen</button>`:''}</div>
-      <div class="row"><input type="text" id="codeIn" maxlength="${CODE_LEN+1}" placeholder="ABCD-2345" value="${esc(last?fmtCode(last):'')}" aria-label="Raum-Code" autocapitalize="characters" autocomplete="off" spellcheck="false" class="codein"><button class="btn" id="joinRoom">Beitreten</button></div>
-      <p class="note">Wer den Raum erstellt, ist Gastgeber. Sein Gerät muss während des Spiels online und an bleiben.</p>
+  overlay(`<div class="page">
+    <div class="page-top"><button class="btn" id="homeBack">‹ Zurück</button><h2>Online spielen</h2></div>
+    <div class="home-profile small">
+      <button class="av-btn" id="editAvOnline" aria-label="Charakter bearbeiten">${avatarSVG(myAv,52)}</button>
+      <div class="profile-in"><label class="note" for="nameIn">Dein Name</label><input type="text" id="nameIn" maxlength="16" placeholder="Wie heißt du?" value="${esc(myName)}" autocomplete="nickname"></div>
     </div>
-    <div><h3>An einem Gerät</h3><p class="note">Abwechselnd am selben Handy oder Tablet, auch mit Computergegnern.</p>
-      <div class="row"><button class="btn" id="localSetup">Spiel einrichten</button></div></div>
-    ${inst}
-  </div>
-  <div class="row mt">${G?'<button class="btn" id="closeOv">Zurück zum Spiel</button>':''}<button class="btn" id="showRules2">Regeln</button><button class="btn" id="showPrivacy">Datenschutz</button></div>
-  <p class="note">Version ${APP_VERSION}</p>`,'menu');
+    <div class="choice">
+      <div><h3>Neues Spiel</h3><p class="note">Du wirst Gastgeber und bekommst einen Code für deine Freunde. Dein Gerät muss während des Spiels online bleiben.</p>
+        <div class="row"><button class="btn primary" id="hostRoom">Raum erstellen</button>${sh?`<button class="btn" id="resumeHost">Raum ${esc(fmtCode(sh.code))} fortsetzen</button>`:''}</div></div>
+      <div><h3>Mitspielen</h3><p class="note">Gib den Code ein, den du bekommen hast.</p>
+        <div class="row"><input type="text" id="codeIn" maxlength="${CODE_LEN+1}" placeholder="ABCD-2345" value="${esc(last?fmtCode(last):'')}" aria-label="Raum-Code" autocapitalize="characters" autocomplete="off" spellcheck="false" class="codein"><button class="btn primary" id="joinRoom">Beitreten</button></div></div>
+    </div>
+  </div>`,'online','full');
+}
+function showSettings(){
+  overlay(`<div class="page">
+    <div class="page-top"><button class="btn" id="homeBack">‹ Zurück</button><h2>Einstellungen</h2></div>
+    <h3>Hintergrund</h3>
+    <div class="themes">${Object.keys(THEMES).map(k=>`<button class="theme${k===themeKey?' on':''}" data-theme-pick="${k}" aria-pressed="${k===themeKey}"><span class="sw" data-sw="${k}"></span><span class="tn">${THEMES[k].name}</span></button>`).join('')}</div>
+    <p class="note">„Automatisch“ folgt dem hellen oder dunklen Modus deines Geräts.</p>
+    <h3>Animationen</h3>
+    <div class="row"><div class="seg"><button id="animOn" class="${animOff?'':'on'}">An</button><button id="animOffBtn" class="${animOff?'on':''}">Aus</button></div><span class="note">Fliegende Karten und hüpfende Figuren</span></div>
+  </div>`,'settings','full');
+  document.querySelectorAll('[data-sw]').forEach(el=>{
+    const t=THEMES[el.dataset.sw];
+    if(t&&t.table) el.style.background=`radial-gradient(circle at 50% 35%, ${t.table}, ${t.table2})`;
+    else el.style.background='linear-gradient(135deg, #dfe9e3 0 50%, #0f2a20 50% 100%)';
+    if(t&&t.accent) el.style.boxShadow=`inset 0 -10px 0 ${t.accent}`;
+  });
 }
 function readName(){ const el=$('nameIn'); if(el){ myName=str(el.value,16); lsSet('etappen-name',myName);} return myName; }
 
@@ -1074,7 +1142,7 @@ function showAvatarEditor(ret){
 }
 function closeAvatarEditor(){
   avDraft=null;
-  if(avReturn==='lobby'&&mode!=='local') showLobby(); else showMenu();
+  if(avReturn==='lobby'&&mode!=='local') showLobby(); else if(avReturn==='online') showOnline(); else showMenu();
 }
 function avatarChanged(){
   if(mode==='host'&&HOST){ const s=HOST.seats.find(x=>x.tok===myTok); if(s&&HOST.status==='lobby'){ s.av=myAv; hostSave(); hostBroadcast(); } }
@@ -1108,7 +1176,7 @@ function showRules(){
   <p><b>Rundenende:</b> Wer keine Karten mehr hat, beendet die Runde. Wer seine Etappe ausgelegt hat, steigt auf. Restkarten zählen: 1–9 = 5, 10–12 = 10, Aussetzen = 15, Joker = 25 Punkte.</p>
   <p><b>Sieg:</b> Wer zuerst Etappe 10 schafft, beendet das Spiel. Schaffen es mehrere in derselben Runde, gewinnt der mit den wenigsten Punkten.</p>
   <table><tr><th>#</th><th>Etappe</th></tr>${PHASES.map((p,i)=>`<tr><td>${i+1}</td><td>${p.t}</td></tr>`).join('')}</table>
-  <div class="row mt"><button class="btn primary" id="rulesBack">Verstanden</button></div></div>`,'rules');
+  <div class="row mt"><button class="btn primary" id="rulesBack">Verstanden</button></div></div>`,'rules',rulesReturn==='menu'?'full':'');
 }
 function showPrivacy(){
   overlay(`<div class="rules"><h2>Datenschutz</h2>
@@ -1124,7 +1192,7 @@ function showPrivacy(){
   </ul>
   <h3>Webseite</h3>
   <p>Die App liegt auf GitHub Pages. GitHub speichert beim Abruf technische Daten wie die IP-Adresse. Schriften und Programmteile liegen direkt auf der Seite, es wird nichts von Google Fonts oder anderen Anbietern nachgeladen.</p>
-  <div class="row mt"><button class="btn primary" id="privacyBack">Zurück</button><button class="btn" id="wipeData">Meine Daten auf diesem Gerät löschen</button></div></div>`,'privacy');
+  <div class="row mt"><button class="btn primary" id="privacyBack">Zurück</button><button class="btn" id="wipeData">Meine Daten auf diesem Gerät löschen</button></div></div>`,'privacy','full');
 }
 
 /* ---------- Updates ---------- */
@@ -1156,6 +1224,13 @@ document.addEventListener('click',async e=>{
   /* Charakter */
   if(id==='editAv'){ readName(); showAvatarEditor('menu'); return; }
   if(id==='editAvLobby'){ showAvatarEditor('lobby'); return; }
+  if(id==='editAvOnline'){ readName(); showAvatarEditor('online'); return; }
+  /* Hauptmenü & Einstellungen */
+  if(id==='goOnline'){ readName(); showOnline(); return; }
+  if(id==='goSettings'){ readName(); showSettings(); return; }
+  if(id==='homeBack'){ readName(); showMenu(); return; }
+  if(t.dataset.themePick){ if(THEMES[t.dataset.themePick]){ themeKey=t.dataset.themePick; lsSet('etappen-theme',themeKey); applyTheme(); showSettings(); } return; }
+  if(id==='animOn'||id==='animOffBtn'){ animOff=id==='animOffBtn'; lsSet('etappen-anim',animOff?'off':'on'); applyTheme(); showSettings(); return; }
   if(t.dataset.av){ const [k,d]=t.dataset.av.split(','); if(AV_PARTS[k]){ const n=AV_PARTS[k]; avDraft[k]=(avDraft[k]+Number(d)+n)%n; showAvatarEditor(); } return; }
   if(id==='avRandom'){ avDraft=randomAv(); showAvatarEditor(); return; }
   if(id==='avSave'){ myAv=cleanAv(avDraft); saveAv(); if(setupCfg[0]&&!setupCfg[0].ai) setupCfg[0].av={...myAv}; avatarChanged(); toast('Charakter gespeichert.'); closeAvatarEditor(); return; }
@@ -1172,7 +1247,7 @@ document.addEventListener('click',async e=>{
   if(id==='privacyBack'){ showMenu(); return; }
   if(id==='wipeData'){
     if(t.dataset.sure!=='1'){ t.dataset.sure='1'; t.textContent='Wirklich löschen? Nochmal tippen'; return; }
-    stopNet(); LS_KEYS.forEach(lsDel); myName=''; myTok=randHex(16); lsSet('etappen-token',myTok);
+    stopNet(); LS_KEYS.forEach(lsDel); myName=''; myTok=randHex(16); lsSet('etappen-token',myTok); themeKey='auto'; animOff=false; applyTheme();
     mode='local'; G=null; render(); toast('Deine Daten auf diesem Gerät wurden gelöscht.'); showMenu(); return; }
   if(id==='btnNew'){ if(ovKey!=='menu') showMenu(); return; }
   if(id==='closeOv'){ overlay(''); render(); return; }
@@ -1247,7 +1322,7 @@ document.addEventListener('input',e=>{ if(e.target.id==='nameIn'){ myName=str(e.
 window.addEventListener('beforeunload',e=>{ if(mode==='host'&&HOST&&onlineCount()&&!reloading){ e.preventDefault(); e.returnValue=''; } });
 
 /* ---------- Start ---------- */
-render(); showMenu();
-if(inviteCode){ const c=$('codeIn'); if(c) c.value=fmtCode(inviteCode); toast('Einladung erkannt: Gib deinen Namen ein und tippe „Beitreten“.'); }
+render();
+if(inviteCode){ showOnline(); toast('Einladung erkannt: Gib deinen Namen ein und tippe „Beitreten“.'); } else showMenu();
 setupSW();
 })();
