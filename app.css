@@ -13,6 +13,7 @@
   --w:clamp(42px, 10.5vw, 76px);
   --wb:clamp(56px, 13vw, 92px);
   --wm:clamp(22px, 5vw, 30px);
+  --ws:clamp(28px, 6.5vw, 40px);
   --dockH:200px;
   color-scheme:light;
 }
@@ -103,8 +104,9 @@ h1 small{font-family:var(--f-body); font-size:.75rem; font-weight:600; color:var
 /* Handy quer / wenig Höhe: Hand als Leiste zum Wischen */
 @media (max-height:520px){
   :root{--w:clamp(40px, 6.5vw, 58px); --wb:52px}
+  :root{--ws:30px}
   .hand{flex-wrap:nowrap; overflow-x:auto; padding-top:12px; margin-top:0}
-  .req{display:none}
+  .slot{padding:3px 6px} .slot-h{font-size:.68rem}
   .wrap{padding-top:6px}
 }
 /* Tablet quer & großer Bildschirm: Spieler links, Tisch rechts */
@@ -144,4 +146,68 @@ th,td{text-align:left; padding:6px 4px; border-bottom:1px solid var(--line)}
 th{font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted)}
 .rules ol,.rules ul{padding-left:20px; line-height:1.55}
 .rules li{margin:3px 0}
+/* ---------- Figuren ---------- */
+svg.av{display:block; flex:0 0 auto; border-radius:50%; overflow:visible; filter:drop-shadow(0 1px 1px rgba(0,0,0,.25))}
+.pl-who{display:flex; align-items:center; gap:8px; min-width:0}
+.pl.cur svg.av{animation:bob 1.1s ease-in-out infinite}
+.who{display:inline-flex; align-items:center; gap:8px; min-width:0}
+.who-btn{display:inline-flex; align-items:center; gap:8px}
+.dock-title{display:flex; align-items:center; gap:8px; flex-wrap:wrap}
+.dock-title .ht-name{font-weight:800}
+.center-av{display:flex; justify-content:center; margin-bottom:6px}
+.center-av.winner svg{animation:cheer 1s ease-in-out infinite}
+.profile{display:flex; gap:12px; align-items:center; margin:8px 0 4px}
+.profile-in{flex:1 1 auto; min-width:0; display:flex; flex-direction:column; gap:4px}
+.profile-in input{padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:#16241d; font:inherit; font-size:16px; min-width:0}
+.av-btn{border:0; background:transparent; padding:0; display:flex; flex-direction:column; align-items:center; gap:2px; color:var(--accent); font-weight:700; font-size:.75rem; border-radius:12px}
+.av-btn:hover svg{transform:scale(1.06) rotate(-3deg)}
+.av-btn svg{transition:transform .15s}
+.av-btn.sm span{display:none}
+.av-edit{display:flex; gap:16px; align-items:center; flex-wrap:wrap; justify-content:center}
+.av-big{flex:0 0 auto}
+.av-rows{display:grid; gap:6px; flex:1 1 240px; min-width:0}
+.av-row{display:grid; grid-template-columns:96px 40px 1fr 40px; align-items:center; gap:6px}
+.av-lbl{font-size:.75rem; font-weight:800; letter-spacing:.06em; text-transform:uppercase; color:var(--muted)}
+.av-val{text-align:center; font-weight:700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.btn.sq{padding:0; width:40px; height:38px; font-size:1.3rem; line-height:1}
+.wiggle{animation:wiggle .45s ease-out}
+.pop-in{animation:pop .35s ease-out both}
+
+/* ---------- Vorablage ---------- */
+.stage{display:flex; gap:8px; flex-wrap:wrap; margin-top:6px; flex:1 1 100%; min-width:0}
+.slot{flex:1 1 150px; min-width:0; border:2px dashed var(--line); border-radius:12px; padding:6px 8px; cursor:pointer; background:color-mix(in srgb, var(--panel) 85%, var(--accent) 15%); transition:border-color .15s, background .15s}
+.slot.on{border-style:solid; border-color:var(--hl); background:color-mix(in srgb, var(--hl) 16%, var(--panel))}
+.slot.ok{border-style:solid; border-color:var(--accent)}
+.slot.ok .slot-h b{color:var(--accent)}
+.slot-h{display:flex; justify-content:space-between; gap:6px; font-size:.75rem; font-weight:800; text-transform:uppercase; letter-spacing:.05em; color:var(--muted)}
+.slot-cards{display:flex; flex-wrap:wrap; gap:3px; margin-top:4px; min-height:calc(var(--ws) * 1.42)}
+.slot-empty{font-size:.78rem; color:var(--muted); align-self:center}
+.card.st{--cw:var(--ws); cursor:pointer}
+.card.st.new{animation:pop .25s ease-out both}
+
+/* ---------- Animationen ---------- */
+#fx{position:fixed; inset:0; pointer-events:none; z-index:15; overflow:hidden}
+.fly{position:absolute; left:0; top:0; will-change:transform}
+.fly .card{box-shadow:0 6px 14px rgba(0,0,0,.28)}
+.card.incoming{visibility:hidden}
+.card.land{animation:land .28s ease-out}
+.card.mini.pop{animation:pop .4s cubic-bezier(.2,.9,.3,1.4) both}
+.groups .grp .card.mini.pop:nth-child(2){animation-delay:.05s} .groups .grp .card.mini.pop:nth-child(3){animation-delay:.1s}
+.groups .grp .card.mini.pop:nth-child(4){animation-delay:.15s} .groups .grp .card.mini.pop:nth-child(5){animation-delay:.2s}
+.groups .grp .card.mini.pop:nth-child(n+6){animation-delay:.25s}
+.pile .card.can{animation:glow 1.4s ease-in-out infinite}
+#turnBanner{position:fixed; left:50%; top:38%; z-index:35; display:flex; align-items:center; gap:12px; padding:12px 20px 12px 12px; border-radius:999px;
+  background:var(--accent); color:var(--accent-fg); font-family:var(--f-display); font-size:clamp(1.2rem,5vw,1.8rem); box-shadow:0 12px 40px rgba(0,0,0,.35); pointer-events:none; transform:translate(-50%,-50%)}
+#turnBanner.show{animation:banner 1.7s cubic-bezier(.2,.9,.3,1.2) both}
+@keyframes banner{0%{transform:translate(-50%,-50%) scale(.3); opacity:0} 15%{transform:translate(-50%,-50%) scale(1.08); opacity:1} 25%{transform:translate(-50%,-50%) scale(1)} 80%{opacity:1; transform:translate(-50%,-50%) scale(1)} 100%{opacity:0; transform:translate(-50%,-60%) scale(.95)}}
+@keyframes pop{0%{transform:scale(.3); opacity:0} 70%{transform:scale(1.12); opacity:1} 100%{transform:scale(1)}}
+@keyframes land{0%{transform:translateY(-6px) scale(1.06)} 100%{transform:none}}
+@keyframes bob{0%,100%{transform:translateY(0)} 50%{transform:translateY(-4px)}}
+@keyframes cheer{0%,100%{transform:rotate(-6deg) scale(1)} 50%{transform:rotate(6deg) scale(1.08)}}
+@keyframes wiggle{0%{transform:scale(.85) rotate(-6deg)} 60%{transform:scale(1.05) rotate(3deg)} 100%{transform:none}}
+@keyframes glow{0%,100%{box-shadow:0 0 0 3px var(--hl), var(--shadow)} 50%{box-shadow:0 0 0 6px color-mix(in srgb,var(--hl) 50%,transparent), var(--shadow)}}
+@media (prefers-reduced-motion: reduce){
+  .pl.cur svg.av,.center-av.winner svg,.wiggle,.pop-in,.card.st.new,.card.land,.card.mini.pop,.pile .card.can,#turnBanner.show{animation:none}
+}
+
 .toast{position:fixed; left:50%; transform:translateX(-50%); bottom:calc(var(--dockH) + 12px); background:var(--fg); color:var(--panel); padding:8px 14px; border-radius:999px; font-weight:600; z-index:30; max-width:90vw; text-align:center}
