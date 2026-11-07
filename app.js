@@ -1,7 +1,7 @@
 /* Etappen-Rommé – Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.2.0';
+const APP_VERSION='1.2.1';
 const PROTO=3;                       // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
@@ -815,13 +815,17 @@ function askSkip(card){
 }
 
 /* Menü */
+const inviteCode=(()=>{ const m=(location.hash||'').match(/^#raum-([A-Za-z0-9-]{8,9})$/); const c=m?normCode(m[1]):''; return CODE_RE.test(c)?c:''; })();
 let installEvt=null;
 window.addEventListener('beforeinstallprompt',e=>{ e.preventDefault(); installEvt=e; if(ovKey==='menu') showMenu(); });
 const standalone=()=>window.matchMedia('(display-mode: standalone)').matches||navigator.standalone===true;
 const isIOS=/iphone|ipad|ipod/i.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 function showMenu(){
   const sh=savedHost();
-  const last=str(lsGet('etappen-last'),CODE_LEN);
+  const lastRaw=normCode(lsGet('etappen-last'));
+  const typed=$('codeIn')?normCode($('codeIn').value):'';
+  const last=typed||inviteCode||(CODE_RE.test(lastRaw)?lastRaw:'');
+  const nameEl=$('nameIn'); if(nameEl) myName=str(nameEl.value,16);
   let inst='';
   if(!standalone()){
     if(installEvt) inst=`<div><h3>Als App installieren</h3><p class="note">Legt Etappen-Rommé als App auf deinen Startbildschirm.</p><div class="row"><button class="btn primary" id="install">App installieren</button></div></div>`;
@@ -1000,7 +1004,6 @@ window.addEventListener('beforeunload',e=>{ if(mode==='host'&&HOST&&onlineCount(
 
 /* ---------- Start ---------- */
 render(); showMenu();
-const m=(location.hash||'').match(/^#raum-([A-Za-z0-9-]{8,9})$/);
-if(m&&CODE_RE.test(normCode(m[1]))){ const c=$('codeIn'); if(c) c.value=fmtCode(normCode(m[1])); toast('Einladung erkannt: Gib deinen Namen ein und tippe „Beitreten“.'); }
+if(inviteCode){ const c=$('codeIn'); if(c) c.value=fmtCode(inviteCode); toast('Einladung erkannt: Gib deinen Namen ein und tippe „Beitreten“.'); }
 setupSW();
 })();
