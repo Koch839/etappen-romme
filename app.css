@@ -297,7 +297,7 @@ button.sv-cell:hover{background:rgba(255,255,255,.32)}
   box-shadow:0 0 0 10px #6b4226, 0 0 0 13px #4a2c18, 0 14px 30px rgba(0,0,0,.35), inset 0 0 40px rgba(0,0,0,.35)}
 .felt-center{position:absolute; inset:0; display:flex; align-items:center; justify-content:center; gap:clamp(12px,4vw,30px); margin:0!important; min-height:0!important}
 .felt .pile{color:rgba(255,255,255,.8)}
-.seats{position:absolute; inset:0; pointer-events:none}
+.tabletop .seats{position:absolute; inset:0; pointer-events:none; margin:0; display:block}
 .seat{position:absolute; transform:translate(-50%,-50%); display:flex; flex-direction:column; align-items:center; gap:2px; pointer-events:auto; width:clamp(92px,22vw,150px); text-align:center}
 .seat-who{display:flex; align-items:center; gap:6px; background:var(--panel); border:1px solid var(--line); border-radius:999px; padding:3px 10px 3px 3px; max-width:100%; box-shadow:0 3px 10px rgba(0,0,0,.18)}
 .seat-txt{display:flex; flex-direction:column; align-items:flex-start; min-width:0; line-height:1.15}
@@ -380,7 +380,9 @@ button.sv-cell:hover{background:rgba(255,255,255,.32)}
 .mm-set-main{display:flex; flex-direction:column; align-items:flex-start; gap:2px; border:0; background:transparent; color:var(--fg); text-align:left; width:100%; padding:2px 0}
 .mm-set-main small{color:var(--muted)}
 .page select{padding:8px 10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:#16241d; font:inherit}
-.page input[type=text]{flex:1 1 160px; min-width:0; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:#16241d; font:inherit; font-size:16px}
+.page .row input[type=text]{flex:1 1 160px}
+.page .profile-in input[type=text]{flex:none}
+.page input[type=text]{min-width:0; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:#16241d; font:inherit; font-size:16px}
 .mm-effs{display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:8px}
 .mm-eff{display:flex; align-items:center; gap:8px; border:1px solid var(--line); border-radius:10px; padding:6px 8px}
 .mm-eff select{flex:1 1 auto; min-width:0}

@@ -1,7 +1,7 @@
 /* Spielhafen – Etappen-Rommé & Schiffe versenken: Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.10.1';
+const APP_VERSION='1.10.3';
 const PROTO=8;                  // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
