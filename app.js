@@ -1,8 +1,8 @@
-/* Etappen-Rommé – Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
+/* Spielhafen – Etappen-Rommé & Schiffe versenken: Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.5.0';
-const PROTO=5;                     // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
+const APP_VERSION='1.7.3';
+const PROTO=7;                   // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
 const MAX_MSG_PER_SEC=25;
@@ -600,27 +600,32 @@ const fmtCode=c=>c.slice(0,4)+'-'+c.slice(4);
 const cryptoOK=()=>{ if(!(window.crypto&&crypto.subtle)){ toast('Dein Browser unterstützt die Verschlüsselung nicht. Bitte aktualisiere ihn.'); return false; } return true; };
 function hostSave(){
   if(!HOST) return;
-  lsSet('etappen-host',JSON.stringify({code:HOST.code,status:HOST.status,seats:HOST.seats,G,ts:Date.now()}));
+  lsSet('etappen-host',JSON.stringify({code:HOST.code,game:HOST.game,status:HOST.status,seats:HOST.seats,G,SV,ts:Date.now()}));
 }
 function savedHost(){ try{ const s=JSON.parse(lsGet('etappen-host')); if(s&&CODE_RE.test(s.code)&&Date.now()-s.ts<48*3600e3) return s; }catch(e){} return null; }
 function rateOK(c){ const now=Date.now(); if(!c._t||now-c._t>1000){c._t=now;c._n=0;} return ++c._n<=MAX_MSG_PER_SEC; }
 const isOnline=c=>Date.now()-c.last<35000;
 
-async function hostGame(resume){
+const GAME_NAME={etappen:'Etappen-Rommé',schiffe:'Schiffe versenken'};
+const maxSeats=()=>HOST&&HOST.game==='schiffe'?2:6;
+async function hostGame(resume,game){
   if(!cryptoOK()) return;
   const name=readName(); if(!resume&&!name){toast('Bitte gib zuerst deinen Namen ein.'); return;}
-  stopNet(); G=null; mode='local'; render();
+  stopNet(); G=null; SV=null; SVV=null; mode='local'; render();
   overlay(`<h2>Raum wird geöffnet …</h2><p class="note">Verschlüsselung wird vorbereitet.</p>`,'wait');
   const code=resume?resume.code:newCode();
   const keys=await roomKeys(code), ecdh=await newECDH();
   mode='host';
-  HOST={code,keys,ecdh,status:resume?resume.status:'lobby',seats:resume?resume.seats:[{tok:myTok,name,ai:false,av:myAv}],clients:new Map()};
+  const g=resume?(resume.game==='schiffe'?'schiffe':'etappen'):(game==='schiffe'?'schiffe':'etappen');
+  HOST={code,keys,ecdh,game:g,status:resume?resume.status:'lobby',seats:resume?resume.seats:[{tok:myTok,name,ai:false,av:myAv}],clients:new Map()};
   const mine=HOST.seats.find(s=>s.tok===myTok); if(mine){ mine.av=myAv; if(HOST.status==='lobby'&&name) mine.name=name; }
-  G=resume&&resume.status==='game'?resume.G:null;
+  G=resume&&resume.status==='game'&&g==='etappen'?resume.G:null;
+  SV=resume&&resume.status==='game'&&g==='schiffe'?resume.SV:null;
+  if(HOST.status==='game'&&!G&&!SV) HOST.status='lobby';
   netStart(keys,keys.topic+'/h',hostOnEnv);
   hostSave(); keepAwake();
   hostTimer=setInterval(hostTick,10000);
-  if(HOST.status==='lobby'){ render(); showLobby(); } else { overlay(''); changed(); }
+  if(HOST.status==='lobby'){ render(); showLobby(); } else { overlay(''); if(SV) svChanged(); else changed(); }
 }
 function hostTick(){
   if(mode!=='host'||!HOST) return;
@@ -657,7 +662,7 @@ async function hostOnEnv(env){
   c.last=Date.now();
   hostOnMsg(c,msg);
 }
-function seatOf(c){ if(!G||!c.tok) return null; const i=G.players.findIndex(p=>p.tok===c.tok); return i<0?null:i; }
+function seatOf(c){ const S=HOST&&HOST.game==='schiffe'?SV:G; if(!S||!c.tok) return null; const i=S.players.findIndex(p=>p.tok===c.tok); return i<0?null:i; }
 function onlineToks(){ const s=new Set([myTok]); HOST&&HOST.clients.forEach(c=>{ if(c.tok&&isOnline(c)) s.add(c.tok); }); return s; }
 function onlineCount(){ let n=0; HOST&&HOST.clients.forEach(c=>{ if(c.tok&&isOnline(c)) n++; }); return n; }
 function viewFor(seat){
@@ -669,7 +674,8 @@ function viewFor(seat){
 }
 function hostSendView(c){
   if(!HOST||!c.tok) return;
-  if(HOST.status==='lobby') hostSend(c,{t:'lobby',v:PROTO,code:HOST.code,seats:HOST.seats.map(s=>({name:s.name,ai:s.ai,av:s.av,me:s.tok===c.tok,host:s.tok===myTok}))});
+  if(HOST.status==='lobby') hostSend(c,{t:'lobby',v:PROTO,game:HOST.game,code:HOST.code,seats:HOST.seats.map(s=>({name:s.name,ai:s.ai,av:s.av,me:s.tok===c.tok,host:s.tok===myTok}))});
+  else if(HOST.game==='schiffe'){ if(!SV) return; const seat=seatOf(c); hostSend(c,{t:'sv',v:PROTO,sn:++c.sn,ack:c.lastSeq,you:seat,view:svView(seat),hostName:HOST.seats[0].name}); }
   else { const seat=seatOf(c); hostSend(c,{t:'state',v:PROTO,sn:++c.sn,ack:c.lastSeq,you:seat,view:viewFor(seat),hostName:HOST.seats[0].name}); }
 }
 function hostBroadcast(){ if(HOST) HOST.clients.forEach(c=>hostSendView(c)); }
@@ -682,7 +688,7 @@ function hostOnMsg(c,d){
     let seat=HOST.seats.find(s=>s.tok===tok);
     if(!seat){
       if(HOST.status!=='lobby') hostSend(c,{t:'info',msg:'Das Spiel läuft schon – du schaust zu.'});
-      else if(HOST.seats.length>=6){ hostSend(c,{t:'deny',msg:'Der Raum ist voll (6 Spieler).'}); HOST.clients.delete(c.cid); return; }
+      else if(HOST.seats.length>=maxSeats()){ hostSend(c,{t:'deny',msg:`Der Raum ist voll (${maxSeats()} Spieler).`}); HOST.clients.delete(c.cid); return; }
       else HOST.seats.push({tok,name,ai:false,av});
     } else if(HOST.status==='lobby'){ seat.name=name; seat.av=av; }
     hostSave();
@@ -702,13 +708,19 @@ function hostOnMsg(c,d){
     if(seq&&seq<=c.lastSeq){ hostSendView(c); return; }   // doppelt angekommen
     c.lastSeq=seq;
     const seat=seatOf(c); if(seat===null) return;
-    const err=applyAction(seat,d.a);
-    if(err){ hostSend(c,{t:'err',msg:err,ack:seq}); hostSendView(c); } else changed();
+    const err=HOST.game==='schiffe'?svApply(seat,d.a):applyAction(seat,d.a);
+    if(err){ hostSend(c,{t:'err',msg:err,ack:seq}); hostSendView(c); } else if(HOST.game==='schiffe') svChanged(); else changed();
   }
 }
 function hostStart(){
   if(!HOST||HOST.seats.length<2) return;
-  HOST.status='game';
+  if(HOST.game==='schiffe'){
+    if(HOST.seats.length!==2){ toast('Schiffe versenken spielt man zu zweit.'); return; }
+    HOST.status='game'; G=null; svDraft=null;
+    SV=svNew(HOST.seats.map(s=>({name:s.name,av:s.av,tok:s.tok})));
+    overlay(''); svChanged(); return;
+  }
+  HOST.status='game'; SV=null;
   G=newGameState(HOST.seats.map(s=>({name:s.name,ai:s.ai,tok:s.ai?null:s.tok,av:s.av})));
   overlay(''); startRound(); changed();
 }
@@ -718,7 +730,7 @@ async function joinGame(codeRaw){
   if(!cryptoOK()) return;
   const name=readName(); if(!name){toast('Bitte gib zuerst deinen Namen ein.'); return;}
   const code=normCode(codeRaw); if(!CODE_RE.test(code)){toast(`Der Raum-Code hat ${CODE_LEN} Zeichen, zum Beispiel ABCD-2345.`); return;}
-  stopNet(); G=null; mode='client'; render();
+  stopNet(); G=null; SV=null; SVV=null; mode='client'; render();
   overlay(`<h2>Verbinde mit Raum ${fmtCode(code)} …</h2><p class="note">Das dauert meist nur ein paar Sekunden.</p><div class="row"><button class="btn" id="toMenu">Abbrechen</button></div>`,'wait');
   const keys=await roomKeys(code), ecdh=await newECDH();
   if(mode!=='client') return;   // inzwischen abgebrochen
@@ -774,15 +786,22 @@ async function clientOnEnv(env){
 function clientOnData(d){
   const C=CLIENT; if(!C) return;
   if(d.ack!=null&&C.pending&&int(d.ack,0,1e9,0)>=C.pending.seq) C.pending=null;
-  if((d.t==='lobby'||d.t==='state')&&d.v!==PROTO){ toast('Deine App-Version passt nicht zu der des Gastgebers. Bitte beide die App aktualisieren.'); return; }
+  if((d.t==='lobby'||d.t==='state'||d.t==='sv')&&d.v!==PROTO){ toast('Deine App-Version passt nicht zu der des Gastgebers. Bitte beide die App aktualisieren.'); return; }
+  if(d.t==='sv'){
+    const sn=int(d.sn,0,1e12,0); if(sn&&sn<=C.sn) return; C.sn=sn;
+    const v=sanitizeSvView(d.view); if(!v) return;
+    G=null; SVV=v; C.you=d.you==null?null:int(d.you,0,1,null); C.hostName=str(d.hostName,16);
+    if(['lobby','wait','notfound'].includes(ovKey)) overlay('');
+    render(); return;
+  }
   if(d.t==='lobby'){
-    C.lobby={code:C.code,seats:(Array.isArray(d.seats)?d.seats:[]).slice(0,6).map(s=>({name:str(s&&s.name,16)||'?',ai:!!(s&&s.ai),av:cleanAv(s&&s.av),me:!!(s&&s.me),host:!!(s&&s.host)}))};
-    G=null; render(); if(['wait','lobby','notfound'].includes(ovKey)||!ovKey) showLobby(); return;
+    C.lobby={code:C.code,game:d.game==='schiffe'?'schiffe':'etappen',seats:(Array.isArray(d.seats)?d.seats:[]).slice(0,6).map(s=>({name:str(s&&s.name,16)||'?',ai:!!(s&&s.ai),av:cleanAv(s&&s.av),me:!!(s&&s.me),host:!!(s&&s.host)}))};
+    G=null; SV=null; SVV=null; render(); if(['wait','lobby','notfound'].includes(ovKey)||!ovKey) showLobby(); return;
   }
   if(d.t==='state'){
     const sn=int(d.sn,0,1e12,0); if(sn&&sn<=C.sn) return; C.sn=sn;
     const v=sanitizeView(d.view); if(!v) return;
-    G=v; C.you=d.you==null?null:int(d.you,0,v.players.length-1,null); C.hostName=str(d.hostName,16);
+    G=v; SVV=null; C.you=d.you==null?null:int(d.you,0,v.players.length-1,null); C.hostName=str(d.hostName,16);
     if(['lobby','wait','notfound'].includes(ovKey)) overlay('');
     render(); return;
   }
@@ -800,7 +819,7 @@ function showNotFound(){
   if(mode!=='client'||!CLIENT) return;
   overlay(`<h2>Raum nicht erreichbar</h2><p>Prüfe den Code. Der Gastgeber muss die App gerade geöffnet haben.</p><p class="note">Ich versuche es im Hintergrund weiter.</p><div class="row mt"><button class="btn primary" id="keepTrying">Weiter warten</button><button class="btn" id="toMenu">Zum Menü</button></div>`,'notfound');
 }
-function leaveToMenu(){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; render(); showMenu(); }
+function leaveToMenu(){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; SV=null; SVV=null; render(); showMenu(); }
 
 /* Bildschirm wach halten, solange online gespielt wird */
 let wakeLock=null;
@@ -913,11 +932,358 @@ function deal(now){
   if(d&&G.disc.length){ discIncoming=true; d.classList.add('incoming'); fly(cardHTML(G.disc[G.disc.length-1]), src, d.getBoundingClientRect(), {delay:10*n*step, dur:380, done:revealDisc}); }
   if(myTurn()) setTimeout(()=>{ if(myTurn()) showTurnBanner(); }, 10*n*step+400);
 }
-function showTurnBanner(){
-  const me=mySeat(); if(me==null) return;
-  const b=$('turnBanner'); b.innerHTML=`${avatarSVG(G.players[me].av,44)}<span>Du bist dran!</span>`;
+function showTurnBanner(av){
+  if(!av){ const me=mySeat(); if(me==null||!G) return; av=G.players[me].av; }
+  if(animOff) return;
+  const b=$('turnBanner'); b.innerHTML=`${avatarSVG(av,44)}<span>Du bist dran!</span>`;
   b.hidden=false; b.classList.remove('show'); void b.offsetWidth; b.classList.add('show');
   clearTimeout(showTurnBanner.t); showTurnBanner.t=setTimeout(()=>{ b.hidden=true; },1700);
+}
+
+/* ======================= SCHIFFE VERSENKEN ======================= */
+const SV_N=10, SV_FLEET=[5,4,3,3,2], SV_ROWS='ABCDEFGHIJ';
+const SV_NAME={5:'Schlachtschiff',4:'Kreuzer',3:'Zerstörer',2:'U-Boot'};
+const SV_ACC={5:'das Schlachtschiff',4:'den Kreuzer',3:'einen Zerstörer',2:'das U-Boot'};
+const SV_EMAX=10;
+const SV_ABIL={
+  radar:{cost:3,name:'Radar',icon:'◎',desc:'Scannt 3×3 Felder. Danach darfst du noch schießen.'},
+  torpedo:{cost:4,name:'Torpedo',icon:'➤',desc:'Läuft durch eine Reihe oder Spalte bis zum ersten Schiff.'},
+  salve:{cost:5,name:'Salve',icon:'⁂',desc:'3 Schüsse auf zufällige Felder.'},
+  bombe:{cost:6,name:'Bombe',icon:'✹',desc:'Trifft 3×3 Felder auf einmal.'}
+};
+let SV=null;          // vollständiger Spielstand (lokal / Gastgeber)
+let SVV=null;         // Sicht, die ein Mitspieler vom Gastgeber bekommt
+let svDraft=null, svAiBusy=false, svSeenN=-1, svPrevCur=null, svMode={abil:null,dir:'h'};
+const svKey=(r,c)=>r+','+c;
+const svActive=()=>mode==='client'?!!SVV:!!SV;
+function svSeat(){
+  if(mode==='client') return CLIENT&&CLIENT.you!=null?CLIENT.you:null;
+  if(!SV) return null;
+  if(mode==='local') return 0;
+  const i=SV.players.findIndex(p=>p.tok===myTok); return i<0?null:i;
+}
+function svCellsOf(r,c,len,h){ const out=[]; for(let i=0;i<len;i++){ const rr=h?r:r+i, cc=h?c+i:c; if(rr<0||cc<0||rr>=SV_N||cc>=SV_N) return null; out.push([rr,cc]); } return out; }
+function svArea(r,c){ const out=[]; for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++){ const rr=r+dr, cc=c+dc; if(rr>=0&&cc>=0&&rr<SV_N&&cc<SV_N) out.push([rr,cc]); } return out; }
+function svTouches(cells,ships){
+  const occ=new Set();
+  ships.forEach(s=>s.cells.forEach(([r,c])=>{ for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++) occ.add(svKey(r+dr,c+dc)); }));
+  return cells.some(([r,c])=>occ.has(svKey(r,c)));
+}
+function svRandomFleet(){
+  for(let t=0;t<300;t++){
+    const ships=[]; let ok=true;
+    for(const len of SV_FLEET){
+      let placed=false;
+      for(let k=0;k<400&&!placed;k++){ const cells=svCellsOf(randInt(SV_N),randInt(SV_N),len,randInt(2)===0); if(cells&&!svTouches(cells,ships)){ ships.push({cells}); placed=true; } }
+      if(!placed){ ok=false; break; }
+    }
+    if(ok) return ships;
+  }
+  return null;
+}
+function svValidFleet(ships){
+  if(!Array.isArray(ships)||ships.length!==SV_FLEET.length) return null;
+  const want=[...SV_FLEET].sort((a,b)=>b-a).join(), have=ships.map(s=>Array.isArray(s)?s.length:0).sort((a,b)=>b-a).join();
+  if(want!==have) return null;
+  const out=[];
+  for(const s of ships){
+    const cells=s.map(p=>[int(p&&p[0],0,SV_N-1,-1),int(p&&p[1],0,SV_N-1,-1)]);
+    if(cells.some(([r,c])=>r<0||c<0)) return null;
+    cells.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+    const h=cells.every(p=>p[0]===cells[0][0]), v=cells.every(p=>p[1]===cells[0][1]);
+    if(!h&&!v) return null;
+    for(let i=1;i<cells.length;i++){ if((h?cells[i][1]-cells[i-1][1]:cells[i][0]-cells[i-1][0])!==1) return null; }
+    if(svTouches(cells,out)) return null;
+    out.push({cells});
+  }
+  return out;
+}
+function svNew(cfg,round){
+  const s={phase:'place',round:round||1,cur:0,winner:null,last:null,log:['Stellt eure Flotten auf!'],
+    players:cfg.map(p=>({name:p.name,av:cleanAv(p.av),tok:p.tok||null,ai:!!p.ai,ships:null,ready:false,hits:{},scans:{},shots:0,hitsMade:0,energy:0}))};
+  s.players.forEach(p=>{ if(p.ai){ p.ships=svRandomFleet(); p.ready=true; } });
+  return s;
+}
+function svLog(t){ SV.log.push(t); if(SV.log.length>30) SV.log.shift(); }
+const svIsSunk=(ship,hits)=>ship.cells.every(([r,c])=>hits[svKey(r,c)]===1);
+/* feuert auf mehrere Felder; gibt Ergebnis zurück */
+function svFire(seat,cells){
+  const me=SV.players[seat], opp=SV.players[1-seat], res=[], sunk=[];
+  for(const [r,c] of cells){
+    const k=svKey(r,c); if(opp.hits[k]!==undefined) continue;
+    const ship=opp.ships.find(s=>s.cells.some(([rr,cc])=>rr===r&&cc===c));
+    opp.hits[k]=ship?1:0; me.shots++; res.push([r,c,ship?1:0]);
+    if(ship){ me.hitsMade++; if(svIsSunk(ship,opp.hits)&&!sunk.includes(ship)) sunk.push(ship); }
+  }
+  return {res, hits:res.filter(x=>x[2]).length, sunk};
+}
+function svAfterFire(seat,type,f,text){
+  const me=SV.players[seat], opp=SV.players[1-seat];
+  let t=text;
+  const NOM={5:'Das Schlachtschiff',4:'Der Kreuzer',3:'Ein Zerstörer',2:'Das U-Boot'};
+  if(f.sunk.length) t+=' '+f.sunk.map(s=>`${NOM[s.cells.length]} ist versenkt!`).join(' ');
+  if(opp.ships.every(s=>svIsSunk(s,opp.hits))){ SV.phase='over'; SV.winner=seat; t+=` ${me.name} hat die ganze Flotte versenkt!`; }
+  else if(!f.hits) SV.cur=1-seat;
+  svLog(t);
+  SV.last={by:seat,type,cells:f.res,sunk:f.sunk.map(s=>s.cells.length),n:(SV.last?SV.last.n:0)+1,text:t};
+}
+function svApply(seat,a){
+  a=a&&typeof a==='object'?a:{};
+  if(!SV) return 'Kein Spiel.';
+  if(seat==null||!SV.players[seat]) return 'Du spielst nicht mit.';
+  const me=SV.players[seat], opp=SV.players[1-seat];
+  if(a.type==='place'){
+    if(SV.phase!=='place') return 'Die Flotten stehen schon.';
+    if(me.ready) return 'Du bist schon bereit.';
+    const ships=svValidFleet(Array.isArray(a.ships)?a.ships.slice(0,6).map(s=>Array.isArray(s)?s.slice(0,6):[]):null);
+    if(!ships) return 'Diese Aufstellung ist nicht erlaubt.';
+    me.ships=ships; me.ready=true; svLog(`${me.name} ist bereit.`);
+    if(SV.players.every(p=>p.ready)){ SV.phase='play'; SV.cur=randInt(2); svLog(`Alle Flotten stehen! ${SV.players[SV.cur].name} beginnt.`); SV.last={by:SV.cur,type:'start',cells:[],sunk:[],n:(SV.last?SV.last.n:0)+1,text:`${SV.players[SV.cur].name} beginnt.`}; }
+    return null;
+  }
+  if(SV.phase!=='play') return 'Gerade kann niemand schießen.';
+  if(SV.cur!==seat) return 'Du bist nicht dran.';
+  const r=int(a.r,0,SV_N-1,-1), c=int(a.c,0,SV_N-1,-1);
+  const name=(rr,cc)=>SV_ROWS[rr]+(cc+1);
+  if(a.type==='shoot'){
+    if(r<0||c<0) return 'Ungültiges Feld.';
+    if(opp.hits[svKey(r,c)]!==undefined) return 'Da hast du schon hingeschossen.';
+    const f=svFire(seat,[[r,c]]);
+    me.energy=Math.min(SV_EMAX,me.energy+1);
+    svAfterFire(seat,'shoot',f, f.hits?`${me.name} trifft auf ${name(r,c)}!`:`${me.name}: ${name(r,c)} – Wasser.`);
+    return null;
+  }
+  const ab=SV_ABIL[a.type]; if(!ab) return 'Unbekannter Zug.';
+  if(me.energy<ab.cost) return `Dafür brauchst du ${ab.cost} Energie.`;
+  if(a.type==='radar'){
+    if(r<0||c<0) return 'Ungültiges Feld.';
+    const cells=svArea(r,c).filter(([rr,cc])=>opp.hits[svKey(rr,cc)]===undefined), res=[];
+    cells.forEach(([rr,cc])=>{ const v=opp.ships.some(s=>s.cells.some(([sr,sc])=>sr===rr&&sc===cc))?1:0; me.scans[svKey(rr,cc)]=v; res.push([rr,cc,v]); });
+    me.energy-=ab.cost;
+    const n=res.filter(x=>x[2]).length, t=`${me.name} scannt um ${name(r,c)}: ${n?n+' Schiffsteil'+(n>1?'e':'')+' entdeckt':'nichts gefunden'}.`;
+    svLog(t); SV.last={by:seat,type:'radar',cells:res,sunk:[],n:(SV.last?SV.last.n:0)+1,text:t};
+    return null;
+  }
+  let cells=[];
+  if(a.type==='bombe'){ if(r<0||c<0) return 'Ungültiges Feld.'; cells=svArea(r,c); }
+  if(a.type==='salve'){ const free=[]; for(let rr=0;rr<SV_N;rr++) for(let cc=0;cc<SV_N;cc++) if(opp.hits[svKey(rr,cc)]===undefined) free.push([rr,cc]); for(let i=0;i<3&&free.length;i++) cells.push(free.splice(randInt(free.length),1)[0]); }
+  if(a.type==='torpedo'){
+    if(r<0||c<0) return 'Ungültiges Feld.';
+    const h=a.dir!=='v';
+    for(let i=0;i<SV_N;i++){ const rr=h?r:i, cc=h?i:c, k=svKey(rr,cc); if(opp.hits[k]!==undefined) continue; cells.push([rr,cc]); if(opp.ships.some(s=>s.cells.some(([sr,sc])=>sr===rr&&sc===cc))) break; }
+  }
+  if(!cells.some(([rr,cc])=>opp.hits[svKey(rr,cc)]===undefined)) return 'Dort gibt es nichts mehr zu treffen.';
+  me.energy-=ab.cost;
+  const f=svFire(seat,cells);
+  const where=a.type==='torpedo'?(a.dir==='v'?`Spalte ${c+1}`:`Reihe ${SV_ROWS[r]}`):a.type==='bombe'?`um ${name(r,c)}`:'';
+  svAfterFire(seat,a.type,f,`${me.name} setzt ${ab.name==='Bombe'?'eine Bombe':ab.name==='Salve'?'eine Salve':'einen Torpedo'} ein${where?' ('+where+')':''}: ${f.hits?f.hits+' Treffer':'kein Treffer'}.`);
+  return null;
+}
+function svView(seat){
+  const toArr=h=>Object.keys(h).map(k=>{ const [r,c]=k.split(',').map(Number); return [r,c,h[k]]; });
+  const me=seat!=null?SV.players[seat]:null, opp=seat!=null?SV.players[1-seat]:null;
+  return {phase:SV.phase, round:SV.round, cur:SV.cur, winner:SV.winner, last:SV.last,
+    players:SV.players.map(p=>({name:p.name,av:p.av,ready:p.ready,left:p.ships?p.ships.filter(s=>!svIsSunk(s,p.hits)).length:SV_FLEET.length,shots:p.shots,hitsMade:p.hitsMade,energy:p.energy})),
+    myShips:me&&me.ships?me.ships.map(s=>s.cells):null, myHits:me?toArr(me.hits):[], myScans:me?toArr(me.scans):[],
+    oppHits:opp?toArr(opp.hits):[], oppSunk:opp&&opp.ships?opp.ships.filter(s=>svIsSunk(s,opp.hits)).map(s=>s.cells):[],
+    oppShips:opp&&opp.ships&&SV.phase==='over'?opp.ships.map(s=>s.cells):null};
+}
+function sanitizeSvView(v){
+  if(!v||typeof v!=='object'||!Array.isArray(v.players)||v.players.length!==2) return null;
+  const cell=p=>[int(p&&p[0],0,9,0),int(p&&p[1],0,9,0)], hit=p=>[int(p&&p[0],0,9,0),int(p&&p[1],0,9,0),int(p&&p[2],0,1,0)];
+  const ships=a=>Array.isArray(a)?a.slice(0,6).map(s=>(Array.isArray(s)?s.slice(0,6):[]).map(cell)):null;
+  const L=v.last&&typeof v.last==='object'?v.last:null;
+  return {phase:['place','play','over'].includes(v.phase)?v.phase:'place', round:int(v.round,1,1e4,1), cur:int(v.cur,0,1,0),
+    winner:v.winner==null?null:int(v.winner,0,1,null),
+    last:L?{by:int(L.by,0,1,0),type:['shoot','radar','torpedo','salve','bombe','start'].includes(L.type)?L.type:'shoot',cells:(Array.isArray(L.cells)?L.cells:[]).slice(0,12).map(hit),sunk:(Array.isArray(L.sunk)?L.sunk:[]).slice(0,5).map(x=>int(x,2,5,2)),n:int(L.n,0,1e6,0),text:str(L.text,200)}:null,
+    players:v.players.map(p=>{ p=p&&typeof p==='object'?p:{}; return {name:str(p.name,16)||'?',av:cleanAv(p.av),ready:!!p.ready,left:int(p.left,0,6,0),shots:int(p.shots,0,200,0),hitsMade:int(p.hitsMade,0,200,0),energy:int(p.energy,0,SV_EMAX,0)}; }),
+    myShips:ships(v.myShips), myHits:(Array.isArray(v.myHits)?v.myHits:[]).slice(0,100).map(hit), myScans:(Array.isArray(v.myScans)?v.myScans:[]).slice(0,100).map(hit),
+    oppHits:(Array.isArray(v.oppHits)?v.oppHits:[]).slice(0,100).map(hit), oppSunk:ships(v.oppSunk)||[], oppShips:ships(v.oppShips)};
+}
+const curSvView=()=>mode==='client'?SVV:(SV?svView(svSeat()):null);
+
+/* Computer: Schachbrett-Suche, verfolgt Treffer, lässt Felder neben versenkten Schiffen aus, nutzt die Bombe */
+function svAiKnow(seat){
+  const opp=SV.players[1-seat], H=opp.hits, tried=k=>H[k]!==undefined;
+  const sunk=new Set(); opp.ships.filter(s=>svIsSunk(s,H)).forEach(s=>s.cells.forEach(([r,c])=>sunk.add(svKey(r,c))));
+  const blocked=new Set(); sunk.forEach(k=>{ const [r,c]=k.split(',').map(Number); for(let dr=-1;dr<=1;dr++) for(let dc=-1;dc<=1;dc++) blocked.add(svKey(r+dr,c+dc)); });
+  const open=(r,c)=>r>=0&&c>=0&&r<SV_N&&c<SV_N&&!tried(svKey(r,c))&&!blocked.has(svKey(r,c));
+  const hits=Object.keys(H).filter(k=>H[k]===1&&!sunk.has(k)).map(k=>k.split(',').map(Number));
+  return {H,tried,open,hits};
+}
+function svAiPick(seat){
+  const {tried,open,hits}=svAiKnow(seat);
+  if(hits.length){
+    let cand=[];
+    if(hits.length>=2){
+      if(hits.every(h=>h[0]===hits[0][0])){ const cs=hits.map(h=>h[1]); cand=[[hits[0][0],Math.min(...cs)-1],[hits[0][0],Math.max(...cs)+1]]; }
+      else if(hits.every(h=>h[1]===hits[0][1])){ const rs=hits.map(h=>h[0]); cand=[[Math.min(...rs)-1,hits[0][1]],[Math.max(...rs)+1,hits[0][1]]]; }
+    }
+    cand=cand.filter(([r,c])=>open(r,c));
+    if(!cand.length) hits.forEach(([r,c])=>[[1,0],[-1,0],[0,1],[0,-1]].forEach(([dr,dc])=>{ if(open(r+dr,c+dc)) cand.push([r+dr,c+dc]); }));
+    if(cand.length) return {type:'shoot',r:cand[0+randInt(cand.length)][0],c:cand[randInt(cand.length)][1],_cand:cand};
+  }
+  const me=SV.players[seat];
+  if(me.energy>=SV_ABIL.bombe.cost){
+    let best=null,bs=-1;
+    for(let r=1;r<SV_N-1;r++) for(let c=1;c<SV_N-1;c++){ const s=svArea(r,c).filter(([rr,cc])=>open(rr,cc)).length; if(s>bs){bs=s;best=[r,c];} }
+    if(best&&bs>=6) return {type:'bombe',r:best[0],c:best[1]};
+  }
+  let pool=[]; for(let r=0;r<SV_N;r++) for(let c=0;c<SV_N;c++) if(open(r,c)&&(r+c)%2===0) pool.push([r,c]);
+  if(!pool.length) for(let r=0;r<SV_N;r++) for(let c=0;c<SV_N;c++) if(open(r,c)) pool.push([r,c]);
+  if(!pool.length) for(let r=0;r<SV_N;r++) for(let c=0;c<SV_N;c++) if(!tried(svKey(r,c))) pool.push([r,c]);
+  const p=pool[randInt(pool.length)]; return {type:'shoot',r:p[0],c:p[1]};
+}
+function maybeSvAI(){
+  if(mode!=='local'||!SV||SV.phase!=='play'||svAiBusy) return;
+  if(!SV.players[SV.cur].ai) return;
+  svAiBusy=true; const mySV=SV;
+  setTimeout(()=>{ svAiBusy=false; if(SV!==mySV||SV.phase!=='play'||!SV.players[SV.cur].ai) return;
+    const seat=SV.cur; let a=svAiPick(seat);
+    if(a._cand){ const p=a._cand[randInt(a._cand.length)]; a={type:'shoot',r:p[0],c:p[1]}; }
+    svApply(seat,a); svChanged(); }, animOff?400:1000);
+}
+function svChanged(){ if(mode==='host'){ hostBroadcast(); hostSave(); } render(); maybeSvAI(); }
+function svAct(a){
+  if(mode==='client'){ if(!hostReachable()){ toast('Keine Verbindung zum Gastgeber – ich versuche es weiter …'); return; } clientAct(a); return; }
+  const err=svApply(svSeat(),a); if(err){ toast(err); return; }
+  svChanged();
+}
+function svStartVsCpu(){
+  readName(); stopNet(); mode='local'; G=null; SVV=null; covered=false; svMode={abil:null,dir:'h'};
+  SV=svNew([{name:myName||'Du',av:myAv},{name:'Computer',av:randomAv(),ai:true}]);
+  overlay(''); svChanged();
+}
+function svDraftFor(V){
+  const key=V.round+'|'+mode;
+  if(!svDraft||svDraft.key!==key) svDraft={key,ships:SV_FLEET.map(len=>({len,cells:null})),sel:0,horiz:true};
+  return svDraft;
+}
+
+/* Spielfeld zeichnen */
+function svShipClasses(ships){
+  const m=new Map();
+  (ships||[]).forEach(cells=>{
+    if(!cells||!cells.length) return;
+    const s=[...cells].sort((a,b)=>a[0]-b[0]||a[1]-b[1]), h=s.length>1&&s[0][0]===s[1][0];
+    s.forEach((p,i)=>m.set(svKey(p[0],p[1]),'ship '+(s.length===1?'':h?'sh-h':'sh-v')+(i===0?' sh-a':'')+(i===s.length-1?' sh-z':'')));
+  });
+  return m;
+}
+function svGridHTML(cellFn){
+  let h='<div class="sv-lab"></div>'; for(let c=0;c<SV_N;c++) h+=`<div class="sv-lab">${c+1}</div>`; h+='<div class="sv-lab"></div>';
+  for(let r=0;r<SV_N;r++){
+    h+=`<div class="sv-lab">${SV_ROWS[r]}</div>`;
+    for(let c=0;c<SV_N;c++){ const o=cellFn(r,c), lab=SV_ROWS[r]+(c+1);
+      h+=o.attr?`<button class="sv-cell ${o.cls}" ${o.attr} aria-label="${lab}"></button>`:`<div class="sv-cell ${o.cls}"></div>`; }
+    h+='<div class="sv-lab"></div>';
+  }
+  for(let c=0;c<SV_N+2;c++) h+='<div class="sv-lab sv-foot"></div>';
+  return h;
+}
+/* Flotte: welche Schiffe schwimmen noch? */
+function svFleetHTML(sunkLens){
+  const left=[...sunkLens];
+  return `<div class="sv-fleet">${SV_FLEET.map(len=>{ const i=left.indexOf(len), sunk=i>=0; if(sunk) left.splice(i,1);
+    return `<span class="fl${sunk?' sunk':''}" title="${SV_NAME[len]}${sunk?' (versenkt)':''}">${'<i></i>'.repeat(len)}</span>`; }).join('')}</div>`;
+}
+function renderSV(){
+  const V=curSvView(); if(!V) return;
+  const me=svSeat(), oi=me!=null?1-me:1, meP=me!=null?V.players[me]:null, op=V.players[oi];
+  const placing=V.phase==='place'&&meP&&!meP.ready, myTurn=V.phase==='play'&&V.cur===me;
+  if(!myTurn) svMode.abil=null;
+  $('roundInfo').textContent=`Schiffe versenken · Spiel ${V.round}`;
+  $('svPlayers').innerHTML=[me!=null?me:0, oi].map(i=>{ const p=V.players[i]; return `<div class="sv-pl${V.phase==='play'&&V.cur===i?' cur':''}">${avatarSVG(p.av,40)}<div class="sv-pl-in"><b>${esc(p.name)}${i===me?' <span class="pl-meta">· du</span>':''}</b><div class="pl-meta">${V.phase==='place'?(p.ready?'bereit ✓':'stellt auf …'):`${p.left}/${SV_FLEET.length} Schiffe übrig`}</div>${V.phase!=='place'?`<div class="energy" aria-label="Energie ${p.energy} von ${SV_EMAX}">${Array.from({length:SV_EMAX},(_,k)=>`<i class="${k<p.energy?'on':''}"></i>`).join('')}</div>`:''}</div></div>`; }).join('');
+  let msg='', sub='';
+  if(placing){ msg='Stelle deine Flotte auf.'; sub='Schiff unten wählen, dann aufs Feld tippen. „Drehen“ wechselt die Richtung. Schiffe dürfen sich nicht berühren.'; }
+  else if(V.phase==='place'){ msg=`Warte auf ${op.name} …`; sub=`${op.name} stellt noch auf.`; }
+  else if(V.phase==='play'){
+    if(myTurn){ msg=svMode.abil?`${SV_ABIL[svMode.abil].name}: Ziel wählen`:'Du bist dran!'; sub=svMode.abil?SV_ABIL[svMode.abil].desc:'Tippe ein Feld im gegnerischen Meer. Treffer = nochmal schießen.'; }
+    else msg=`${V.players[V.cur].name} zielt …`;
+  } else msg=V.winner===me?'Gewonnen!':`${V.players[V.winner].name} gewinnt.`;
+  if(mode==='client'&&!hostReachable()) sub='Verbindung zum Gastgeber unterbrochen – ich versuche es automatisch weiter …';
+  $('svMsg').textContent=msg; $('svSub').textContent=sub;
+  $('svLog').innerHTML=V.last&&V.last.text?`<div class="sv-last">${esc(V.last.text)}</div>`:'';
+  const fresh=V.last&&V.last.n!==svSeenN?V.last:null;
+  const freshSet=new Set(fresh?fresh.cells.map(([r,c])=>svKey(r,c)):[]);
+  // Gegnerisches Meer
+  const oppWrap=$('svOppWrap');
+  if(placing||V.phase==='place'){ oppWrap.hidden=true; }
+  else {
+    oppWrap.hidden=false;
+    $('svOppTitle').innerHTML=`${avatarSVG(op.av,22)} Meer von ${esc(op.name)} ${svFleetHTML(V.oppSunk.map(s=>s.length))}`;
+    const hits=new Map(V.oppHits.map(([r,c,h])=>[svKey(r,c),h])), sunk=new Set(V.oppSunk.flat().map(([r,c])=>svKey(r,c)));
+    const scans=new Map((V.myScans||[]).map(([r,c,v])=>[svKey(r,c),v]));
+    const reveal=svShipClasses(V.oppShips), canShoot=myTurn;
+    $('svOpp').innerHTML=svGridHTML((r,c)=>{
+      const k=svKey(r,c), h=hits.get(k); let cls=reveal.get(k)?reveal.get(k)+' ghost':'';
+      if(h===1) cls+=' hit'+(sunk.has(k)?' sunk':''); else if(h===0) cls+=' miss';
+      else if(scans.has(k)) cls+=scans.get(k)?' scan-ship':' scan-empty';
+      if(fresh&&fresh.by===me&&freshSet.has(k)) cls+=fresh.type==='radar'?' scan-fresh':' fresh';
+      const target=canShoot&&(h===undefined||svMode.abil==='radar'||svMode.abil==='bombe'||svMode.abil==='torpedo');
+      return {cls, attr:target?`data-sv="${r},${c}"`:''};
+    });
+    $('svOpp').className='sv-grid opp'+(canShoot?' aim':'')+(svMode.abil?' mode-'+svMode.abil:'');
+  }
+  // Eigenes Meer
+  const d=placing?svDraftFor(V):null;
+  const myShips=placing?d.ships.filter(s=>s.cells).map(s=>s.cells):V.myShips;
+  const shipCls=svShipClasses(myShips), myHits=new Map(V.myHits.map(([r,c,h])=>[svKey(r,c),h]));
+  const mySunk=(V.myShips||[]).filter(cells=>cells.every(([r,c])=>myHits.get(svKey(r,c))===1)).map(s=>s.length);
+  $('svMeTitle').innerHTML=`${meP?avatarSVG(meP.av,22):''} Deine Flotte ${placing?'':svFleetHTML(mySunk)}`;
+  $('svMe').innerHTML=svGridHTML((r,c)=>{
+    const k=svKey(r,c), h=myHits.get(k); let cls=shipCls.get(k)||'';
+    if(h===1) cls+=' hit'; else if(h===0) cls+=' miss';
+    if(fresh&&fresh.by!==me&&fresh.type!=='radar'&&freshSet.has(k)) cls+=' fresh';
+    return {cls, attr:placing?`data-svp="${r},${c}"`:''};
+  });
+  $('svMeWrap').classList.toggle('big',placing);
+  // Steuerung
+  let ctrl='';
+  if(placing){
+    const all=d.ships.every(s=>s.cells);
+    ctrl=`<div class="sv-ships">${d.ships.map((s,i)=>`<button class="sv-ship${d.sel===i?' on':''}${s.cells?' done':''}" data-svship="${i}" aria-label="${SV_NAME[s.len]}, ${s.len} Felder"><span class="blocks">${'<i></i>'.repeat(s.len)}</span><small>${SV_NAME[s.len]}${s.cells?' ✓':''}</small></button>`).join('')}</div>
+      <div class="actions"><button class="btn" id="svRotate">Drehen: ${d.horiz?'waagerecht':'senkrecht'}</button><button class="btn" id="svRandom">Zufällig</button><button class="btn" id="svClear">Leeren</button><button class="btn primary" id="svReady" ${all?'':'disabled'}>Fertig – Flotte steht</button></div>`;
+  }
+  let abil='';
+  if(V.phase==='play'&&meP){
+    const en=meP.energy;
+    abil=`<div class="abil-bar"><div class="abil-head"><b>Spezialangriffe</b><span class="pl-meta">Jeder normale Schuss lädt 1 Energie auf (max. ${SV_EMAX}).</span></div>
+      <div class="abils">${Object.entries(SV_ABIL).map(([k,a])=>`<button class="abil${svMode.abil===k?' on':''}${en>=a.cost?' ready':''}" data-abil="${k}" ${myTurn&&en>=a.cost?'':'disabled'}><span class="ai">${a.icon}</span><b>${a.name}</b><small>${a.cost} ⚡</small></button>`).join('')}</div>
+      ${svMode.abil==='torpedo'?`<div class="actions"><button class="btn" id="svTorpDir">Richtung: ${svMode.dir==='h'?'Reihe (→)':'Spalte (↓)'}</button></div>`:''}
+      ${svMode.abil?`<div class="actions"><button class="btn" id="svAbilCancel">Abbrechen</button></div>`:''}</div>`;
+  }
+  $('svCtrl').innerHTML=ctrl; $('svAbil').innerHTML=abil;
+  if(fresh) svSeenN=fresh.n;
+  if(myTurn&&svPrevCur!==me&&meP) showTurnBanner(meP.av);
+  svPrevCur=V.phase==='play'?V.cur:null;
+  // Spielende
+  if(V.phase==='over'){
+    const k='svend'+V.round;
+    if(ovKey!==k&&!['rules','menu','settings','privacy','online','avatar'].includes(ovKey)){
+      const w=V.players[V.winner], canGo=mode!=='client';
+      const rows=V.players.map(p=>`<tr><td><span class="who">${avatarSVG(p.av,26)}${esc(p.name)}</span></td><td>${p.shots}</td><td>${p.hitsMade}</td><td>${p.shots?Math.round(p.hitsMade/p.shots*100):0} %</td></tr>`).join('');
+      setTimeout(()=>{ if(svActive()&&curSvView().phase==='over'&&ovKey!==k) overlay(`<div class="center-av winner">${avatarSVG(w.av,110,'av av-xl')}</div><h2>${esc(w.name)} gewinnt!</h2><p>Die ganze Flotte liegt auf dem Meeresgrund.</p><table><tr><th>Spieler</th><th>Schüsse</th><th>Treffer</th><th>Quote</th></tr>${rows}</table>${canGo?'':`<p class="note">Warte, ob ${esc((CLIENT&&CLIENT.hostName)||'der Gastgeber')} eine Revanche startet.</p>`}<div class="row mt">${canGo?'<button class="btn primary" id="svAgain">Revanche</button>':''}<button class="btn" id="toMenu">Zum Menü</button></div>`,k); }, animOff?0:900);
+    }
+  } else if(ovKey.startsWith('svend')) overlay('');
+}
+function svAgain(){
+  if(!SV) return;
+  SV=svNew(SV.players.map(p=>({name:p.name,av:p.av,tok:p.tok,ai:p.ai})),SV.round+1);
+  svDraft=null; svMode={abil:null,dir:'h'}; overlay(''); svChanged();
+}
+function showSvRules(ret){
+  overlay(`<div class="rules"><h2>Schiffe versenken</h2>
+    <ol>
+      <li><b>Aufstellen:</b> Jeder stellt seine Flotte geheim auf: Schlachtschiff (5 Felder), Kreuzer (4), zwei Zerstörer (je 3) und ein U-Boot (2). Schiffe stehen waagerecht oder senkrecht und dürfen sich nicht berühren – auch nicht über Eck.</li>
+      <li><b>Schießen:</b> Abwechselnd tippt ihr ein Feld im gegnerischen Meer an. ● heißt Wasser, ✕ heißt Treffer. Wer trifft, darf nochmal.</li>
+      <li><b>Energie:</b> Jeder normale Schuss lädt 1 Energie auf (höchstens ${SV_EMAX}). Damit kannst du Spezialangriffe einsetzen:
+        <ul>${Object.values(SV_ABIL).map(a=>`<li><b>${a.icon} ${a.name} (${a.cost} ⚡):</b> ${a.desc}</li>`).join('')}</ul>
+        Trifft ein Angriff etwas, darfst du nochmal. Das Radar schießt nicht – danach bist du weiter dran.</li>
+      <li><b>Sieg:</b> Wer zuerst alle gegnerischen Schiffe versenkt, gewinnt. Über jedem Meer siehst du, welche Schiffe noch schwimmen.</li>
+    </ol>
+    <div class="row mt"><button class="btn primary" id="svRulesBack">Verstanden</button></div></div>`,'rules',ret==='menu'?'full':'');
+  showSvRules.ret=ret;
 }
 
 function render(){
@@ -926,6 +1292,11 @@ function render(){
   if(mode==='host'&&HOST){ const ok=netOnline(); chip.hidden=false; chip.className='netchip'+(ok?'':' bad'); chip.textContent=ok?`Gastgeber · ${fmtCode(HOST.code)} · ${onlineCount()+1} online`:'Kein Internet – verbinde neu …'; }
   else if(mode==='client'&&CLIENT){ const ok=hostReachable(); chip.hidden=false; chip.className='netchip'+(ok?'':' bad'); chip.textContent=ok?'Online · '+fmtCode(CLIENT.code):(netOnline()?'Suche Gastgeber …':'Kein Internet – verbinde neu …'); }
   else chip.hidden=true;
+  if(svActive()){
+    $('players').innerHTML=''; $('center').hidden=true; $('dock').hidden=true; $('board').hidden=true; $('sv').hidden=false; measureDock();
+    prevSnap=null; renderSV(); return;
+  }
+  $('sv').hidden=true; $('board').hidden=false; svPrevCur=null;
   if(!G){
     $('roundInfo').textContent=''; $('players').innerHTML=''; $('center').hidden=true; $('dock').hidden=true; measureDock();
     prevSnap=null; incoming.clear(); discIncoming=false;
@@ -1080,26 +1451,39 @@ function installBlock(){
 function showMenu(){
   const nameEl=$('nameIn'); if(nameEl) myName=str(nameEl.value,16);
   const fan=[{k:'n',n:1,c:0},{k:'n',n:7,c:1},{k:'j'},{k:'n',n:12,c:3},{k:'n',n:5,c:2}];
+  const mini=[{k:'n',n:3,c:0},{k:'j'},{k:'n',n:9,c:1}];
+  const boat=`<svg class="boat" viewBox="0 0 120 70" aria-hidden="true"><path d="M8 44 L112 44 L98 62 L22 62 Z" fill="#8a96a3" stroke="#1d1b26" stroke-width="3" stroke-linejoin="round"/><rect x="38" y="30" width="34" height="14" rx="3" fill="#ced4da" stroke="#1d1b26" stroke-width="3"/><rect x="50" y="16" width="10" height="14" fill="#ff6b6b" stroke="#1d1b26" stroke-width="3"/><path d="M0 66 Q15 60 30 66 T60 66 T90 66 T120 66" fill="none" stroke="#e8f4ff" stroke-width="3" stroke-linecap="round"/></svg>`;
+  const playing=G||svActive();
   overlay(`<div class="home">
     <div class="home-hero">
       <div class="fan" aria-hidden="true">${fan.map((c,i)=>decoCard(c,'fan-'+i)).join('')}</div>
-      <h1 class="logo">Etappen<span>Rommé</span></h1>
-      <p class="tag">10 Etappen. Wer schafft sie zuerst?</p>
+      <h1 class="logo">Spiel<span>hafen</span></h1>
+      <p class="tag">Karten, Schiffe und ein Spieleabend – mit Freunden oder gegen den Computer.</p>
     </div>
     <div class="home-profile">
       <button class="av-btn" id="editAv" aria-label="Charakter bearbeiten">${avatarSVG(myAv,76)}<span>Bearbeiten</span></button>
       <div class="profile-in"><label class="note" for="nameIn">Dein Name</label><input type="text" id="nameIn" maxlength="16" placeholder="Wie heißt du?" value="${esc(myName)}" autocomplete="nickname"></div>
     </div>
+    ${playing?`<button class="hbtn go" id="closeOv"><b>Weiterspielen</b><small>Zurück zum laufenden Spiel</small></button>`:''}
+    <div class="tiles">
+      <div class="tile tile-cards">
+        <div class="tile-art" aria-hidden="true">${mini.map((c,i)=>decoCard(c,'tf-'+i)).join('')}</div>
+        <div class="tile-body"><b>Etappen-Rommé</b><small>10 Etappen · 2–6 Spieler · auch gegen Computer</small>
+          <div class="tile-btns"><button class="btn primary" id="localSetup">Spielen</button><button class="btn" id="hostRoom">Online-Raum</button><button class="btn" id="showRules2">Regeln</button></div></div>
+      </div>
+      <div class="tile tile-sea">
+        <div class="tile-art" aria-hidden="true">${boat}</div>
+        <div class="tile-body"><b>Schiffe versenken</b><small>Mit Radar, Torpedo, Bombe & Salve · 2 Spieler</small>
+          <div class="tile-btns"><button class="btn primary" id="svVsCpu">Gegen Computer</button><button class="btn" id="svOnline">Online-Raum</button><button class="btn" id="svRulesBtn">Regeln</button></div></div>
+      </div>
+    </div>
     <div class="home-btns">
-      ${G?`<button class="hbtn go" id="closeOv"><b>Weiterspielen</b><small>Zurück zum laufenden Spiel</small></button>`:''}
-      <button class="hbtn go" id="goOnline"><b>Online spielen</b><small>Jeder an seinem eigenen Gerät</small></button>
-      <button class="hbtn" id="localSetup"><b>An einem Gerät</b><small>Mit Freunden oder gegen den Computer</small></button>
+      <button class="hbtn" id="goOnline"><b>Mit Code beitreten</b><small>Ein Freund hat einen Raum erstellt?</small></button>
       <button class="hbtn" id="goSettings"><b>Einstellungen</b><small>Hintergrund und Animationen</small></button>
     </div>
     <div class="home-foot">
-      <button class="hlink" id="showRules2">Regeln</button>
       <button class="hlink" id="showPrivacy">Datenschutz</button>
-      ${G?'<button class="hlink" id="toMenu">Spiel beenden</button>':''}
+      ${G||svActive()?'<button class="hlink" id="toMenu">Spiel beenden</button>':''}
       ${installBlock()}
       <span class="hnote">Version ${APP_VERSION}</span>
     </div>
@@ -1119,7 +1503,8 @@ function showOnline(){
     </div>
     <div class="choice">
       <div><h3>Neues Spiel</h3><p class="note">Du wirst Gastgeber und bekommst einen Code für deine Freunde. Dein Gerät muss während des Spiels online bleiben.</p>
-        <div class="row"><button class="btn primary" id="hostRoom">Raum erstellen</button>${sh?`<button class="btn" id="resumeHost">Raum ${esc(fmtCode(sh.code))} fortsetzen</button>`:''}</div></div>
+        <div class="row"><button class="btn primary" id="hostRoom">Etappen-Rommé-Raum</button><button class="btn primary" id="hostRoomSv">Schiffe-versenken-Raum</button></div>
+        ${sh?`<div class="row"><button class="btn" id="resumeHost">Raum ${esc(fmtCode(sh.code))} fortsetzen (${GAME_NAME[sh.game==='schiffe'?'schiffe':'etappen']})</button></div>`:''}</div>
       <div><h3>Mitspielen</h3><p class="note">Gib den Code ein, den du bekommen hast.</p>
         <div class="row"><input type="text" id="codeIn" maxlength="${CODE_LEN+1}" placeholder="ABCD-2345" value="${esc(last?fmtCode(last):'')}" aria-label="Raum-Code" autocapitalize="characters" autocomplete="off" spellcheck="false" class="codein"><button class="btn primary" id="joinRoom">Beitreten</button></div></div>
     </div>
@@ -1145,18 +1530,20 @@ function readName(){ const el=$('nameIn'); if(el){ myName=str(el.value,16); lsSe
 
 /* Lobby */
 function showLobby(){
-  let seats, isHost, code;
-  if(mode==='host'&&HOST){ isHost=true; code=HOST.code; const on=onlineToks(); seats=HOST.seats.map(s=>({name:s.name,ai:s.ai,av:s.av,me:s.tok===myTok,host:s.tok===myTok,off:!s.ai&&!on.has(s.tok)})); }
-  else if(mode==='client'&&CLIENT&&CLIENT.lobby){ isHost=false; code=CLIENT.lobby.code; seats=CLIENT.lobby.seats; }
+  let seats, isHost, code, game='etappen';
+  if(mode==='host'&&HOST){ isHost=true; code=HOST.code; game=HOST.game; const on=onlineToks(); seats=HOST.seats.map(s=>({name:s.name,ai:s.ai,av:s.av,me:s.tok===myTok,host:s.tok===myTok,off:!s.ai&&!on.has(s.tok)})); }
+  else if(mode==='client'&&CLIENT&&CLIENT.lobby){ isHost=false; code=CLIENT.lobby.code; seats=CLIENT.lobby.seats; game=CLIENT.lobby.game; }
   else return;
+  const sv=game==='schiffe', max=sv?2:6;
   const list=seats.map((s,i)=>`<li class="pop-in"><span class="who">${avatarSVG(s.av,36)}<b>${esc(s.name)}</b></span><span>${s.ai?'Computer':s.host?'Gastgeber':''}${s.me?' · du':''}${s.off?' · offline':''}${isHost&&!s.me?` <button class="btn sm" data-kick="${i}">Entfernen</button>`:''}</span></li>`).join('');
-  overlay(`<h2>Raum</h2><p>Gib nur deinen Mitspielern diesen Code. Sie öffnen die App, tippen auf „Beitreten“ und geben ihn ein.</p>
+  overlay(`<h2>Raum · ${GAME_NAME[game]}</h2><p>Gib nur deinen Mitspielern diesen Code. Sie öffnen die App, tippen auf „Beitreten“ und geben ihn ein.</p>
     <div class="row"><span class="code">${esc(fmtCode(code))}</span></div>
     <div class="row"><button class="btn primary" id="shareInvite">Einladung teilen</button><button class="btn" id="copyCode">Code kopieren</button></div>
-    <h3>Spieler (${seats.length}/6)</h3><ul class="seats">${list}</ul>
+    <h3>Spieler (${seats.length}/${max})</h3><ul class="seats">${list}</ul>
+    ${sv&&seats.length<2?'<p class="note">Schiffe versenken spielt man zu zweit – warte auf deinen Gegner.</p>':''}
     ${isHost?'<p class="note">Unbekannte Namen kannst du mit „Entfernen“ wieder hinauswerfen.</p>':''}
     <div class="row mt">
-      ${isHost?`<button class="btn primary" id="startOnline" ${seats.length>=2?'':'disabled'}>Spiel starten</button><button class="btn" id="addBot" ${seats.length<6?'':'disabled'}>Computer hinzufügen</button>`:'<span class="note">Warte, bis der Gastgeber das Spiel startet …</span>'}
+      ${isHost?`<button class="btn primary" id="startOnline" ${(sv?seats.length===2:seats.length>=2)?'':'disabled'}>Spiel starten</button>${sv?'':`<button class="btn" id="addBot" ${seats.length<6?'':'disabled'}>Computer hinzufügen</button>`}`:'<span class="note">Warte, bis der Gastgeber das Spiel startet …</span>'}
       <button class="btn" id="editAvLobby">Charakter ändern</button>
       <button class="btn" id="leaveRoom">Raum verlassen</button>
     </div>`,'lobby');
@@ -1214,7 +1601,7 @@ function showRules(){
 }
 function showPrivacy(){
   overlay(`<div class="rules"><h2>Datenschutz</h2>
-  <p>Etappen-Rommé hat keine Konten, keine Werbung, keine Tracker und keine eigene Datenbank.</p>
+  <p>Spielhafen hat keine Konten, keine Werbung, keine Tracker und keine eigene Datenbank.</p>
   <h3>Auf deinem Gerät</h3>
   <p>Gespeichert werden nur: dein Name, deine Figur, eine zufällige Geräte-Kennung (damit du nach einem Verbindungsabbruch deinen Platz wiederbekommst), der letzte Raum-Code, deine Spiel-Einstellungen und – wenn du Gastgeber bist – der laufende Spielstand. Diese Daten verlassen dein Gerät nicht von selbst.</p>
   <h3>Beim Online-Spiel</h3>
@@ -1274,7 +1661,44 @@ document.addEventListener('click',async e=>{
     if(mode==='host'&&HOST){ hostSave(); }
     reloading=true; const w=swReg&&swReg.waiting; if(w) w.postMessage('skipWaiting'); else location.reload(); return; }
   if(id==='laterUpdate'){ $('updateBar').hidden=true; return; }
-  if(id==='btnRules'){ if(!ovKey||ovKey==='menu'||ovKey==='lobby'){ rulesReturn=ovKey; showRules(); } return; }
+  if(id==='btnRules'){ if(!ovKey||ovKey==='menu'||ovKey==='lobby'){ if(svActive()&&!ovKey) showSvRules(''); else { rulesReturn=ovKey; showRules(); } } return; }
+  /* Schiffe versenken */
+  if(id==='svVsCpu'){ svStartVsCpu(); return; }
+  if(id==='svOnline'||id==='hostRoomSv'){ hostGame(null,'schiffe'); return; }
+  if(id==='svRulesBtn'){ readName(); showSvRules('menu'); return; }
+  if(id==='svRulesBack'){ if(showSvRules.ret==='menu') showMenu(); else { overlay(''); render(); } return; }
+  if(id==='svAgain'){ if(mode!=='client') svAgain(); return; }
+  if(t.dataset.abil&&svActive()){
+    const k=t.dataset.abil; if(!SV_ABIL[k]) return;
+    if(k==='salve'){ svMode.abil=null; svAct({type:'salve'}); return; }
+    svMode.abil=svMode.abil===k?null:k; render(); return; }
+  if(id==='svTorpDir'){ svMode.dir=svMode.dir==='h'?'v':'h'; render(); return; }
+  if(id==='svAbilCancel'){ svMode.abil=null; render(); return; }
+  if(t.dataset.sv&&svActive()){
+    const [r,c]=t.dataset.sv.split(',').map(Number);
+    if(svMode.abil){ const k=svMode.abil; svMode.abil=null; svAct({type:k,r,c,dir:svMode.dir}); }
+    else svAct({type:'shoot',r,c});
+    return; }
+  if(svActive()&&(t.dataset.svp||t.dataset.svship!=null||['svRotate','svRandom','svClear','svReady'].includes(id))){
+    const V=curSvView(); if(!V||V.phase!=='place') return; const d=svDraftFor(V);
+    if(t.dataset.svship!=null){ const i=int(t.dataset.svship,0,SV_FLEET.length-1,0); if(d.ships[i].cells) d.ships[i].cells=null; d.sel=i; render(); return; }
+    if(id==='svRotate'){ d.horiz=!d.horiz; render(); return; }
+    if(id==='svClear'){ d.ships.forEach(s=>s.cells=null); d.sel=0; render(); return; }
+    if(id==='svRandom'){ const f=svRandomFleet(); if(f) d.ships.forEach((s,i)=>s.cells=f[i].cells); d.sel=null; render(); return; }
+    if(id==='svReady'){ if(d.ships.every(s=>s.cells)) svAct({type:'place',ships:d.ships.map(s=>s.cells)}); return; }
+    if(t.dataset.svp){
+      const [r,c]=t.dataset.svp.split(',').map(Number);
+      const hitIdx=d.ships.findIndex(s=>s.cells&&s.cells.some(([rr,cc])=>rr===r&&cc===c));
+      if(hitIdx>=0){ d.ships[hitIdx].cells=null; d.sel=hitIdx; render(); return; }   // Schiff wieder aufnehmen
+      if(d.sel==null||d.ships[d.sel].cells){ const n=d.ships.findIndex(s=>!s.cells); if(n<0) return; d.sel=n; }
+      const s=d.ships[d.sel];
+      let cells=svCellsOf(r,c,s.len,d.horiz);
+      if(!cells){ cells=d.horiz?svCellsOf(r,SV_N-s.len,s.len,true):svCellsOf(SV_N-s.len,c,s.len,false); }   // am Rand: zurückschieben
+      if(!cells){ toast('Das Schiff passt hier nicht hin.'); return; }
+      if(svTouches(cells,d.ships.filter(x=>x!==s&&x.cells))){ toast('Schiffe dürfen sich nicht berühren – auch nicht über Eck.'); return; }
+      s.cells=cells; const n=d.ships.findIndex(x=>!x.cells); d.sel=n>=0?n:null; render(); return;
+    }
+  }
   if(id==='showRules2'){ readName(); rulesReturn='menu'; showRules(); return; }
   if(id==='rulesBack'){ const r=rulesReturn; rulesReturn=null; if(r==='menu') showMenu(); else if(r==='lobby') showLobby(); else { overlay(''); render(); } return; }
   if(id==='showPrivacy'){ readName(); showPrivacy(); return; }
@@ -1282,7 +1706,7 @@ document.addEventListener('click',async e=>{
   if(id==='wipeData'){
     if(t.dataset.sure!=='1'){ t.dataset.sure='1'; t.textContent='Wirklich löschen? Nochmal tippen'; return; }
     stopNet(); LS_KEYS.forEach(lsDel); myName=''; myTok=randHex(16); lsSet('etappen-token',myTok); themeKey='auto'; animOff=false; applyTheme();
-    mode='local'; G=null; render(); toast('Deine Daten auf diesem Gerät wurden gelöscht.'); showMenu(); return; }
+    mode='local'; G=null; SV=null; SVV=null; render(); toast('Deine Daten auf diesem Gerät wurden gelöscht.'); showMenu(); return; }
   if(id==='btnNew'){ if(ovKey!=='menu') showMenu(); return; }
   if(id==='closeOv'){ overlay(''); render(); return; }
   if(id==='install'){ if(installEvt){ installEvt.prompt(); try{ await installEvt.userChoice; }catch(_){} installEvt=null; showMenu(); } return; }
@@ -1291,23 +1715,24 @@ document.addEventListener('click',async e=>{
   if(t.dataset.count){readSetupNames(); const n=int(t.dataset.count,2,6,4); while(setupCfg.length<n) setupCfg.push({name:'Spieler '+(setupCfg.length+1),ai:true,av:randomAv()}); setupCfg=setupCfg.slice(0,n); showSetup(); return;}
   if(t.dataset.type){readSetupNames(); const [i,v]=t.dataset.type.split(',').map(Number); if(setupCfg[i]) setupCfg[i].ai=!!v; showSetup(); return;}
   if(id==='startLocal'){ readSetupNames(); lsSet('etappen-setup',JSON.stringify(setupCfg)); stopNet(); overlay('');
-    mode='local'; G=newGameState(setupCfg); const h=humans(); viewer=h.length===1?h[0]:null; covered=false; startRound(); changed(); return; }
-  if(id==='hostRoom'){ hostGame(null); return; }
+    mode='local'; SV=null; SVV=null; G=newGameState(setupCfg); const h=humans(); viewer=h.length===1?h[0]:null; covered=false; startRound(); changed(); return; }
+  if(id==='hostRoom'){ hostGame(null,'etappen'); return; }
   if(id==='resumeHost'){ const sh=savedHost(); if(sh) hostGame(sh); return; }
   if(id==='joinRoom'){ joinGame($('codeIn').value); return; }
   if(id==='copyCode'){ const code=fmtCode(mode==='host'?HOST.code:CLIENT.code); try{ await navigator.clipboard.writeText(code); toast('Code kopiert.'); }catch(err){ toast('Code: '+code); } return; }
   if(id==='shareInvite'){
     const code=mode==='host'?HOST.code:CLIENT.code;
     const url=location.origin+location.pathname+'#raum-'+code;
-    const text=`Spiel Etappen-Rommé mit mir! Raum-Code: ${fmtCode(code)}`;
-    if(navigator.share){ try{ await navigator.share({title:'Etappen-Rommé',text,url}); }catch(err){} }
+    const gname=GAME_NAME[(mode==='host'?HOST.game:(CLIENT.lobby&&CLIENT.lobby.game))||'etappen'];
+    const text=`Spiel ${gname} mit mir im Spielhafen! Raum-Code: ${fmtCode(code)}`;
+    if(navigator.share){ try{ await navigator.share({title:'Spielhafen',text,url}); }catch(err){} }
     else { try{ await navigator.clipboard.writeText(text+'\n'+url); toast('Einladung kopiert – füge sie z. B. in WhatsApp ein.'); }catch(err){ toast('Code: '+fmtCode(code)); } }
     return; }
   if(id==='keepTrying'){ if(CLIENT){ CLIENT.start=Date.now(); } overlay(`<h2>Suche den Raum …</h2><p class="note">Sobald der Gastgeber online ist, geht es los.</p><div class="row"><button class="btn" id="toMenu">Abbrechen</button></div>`,'wait'); return; }
   if(id==='addBot'&&HOST){ if(HOST.seats.length<6){ const n=HOST.seats.filter(s=>s.ai).length+1; HOST.seats.push({tok:'bot-'+randHex(6),name:'Computer '+n,ai:true,av:randomAv()}); hostSave(); showLobby(); hostBroadcast(); } return; }
   if(t.dataset.kick!=null&&HOST){ const k=int(t.dataset.kick,0,5,-1); const s=HOST.seats[k]; if(s&&s.tok!==myTok&&HOST.status==='lobby'){ HOST.seats.splice(k,1); HOST.clients.forEach((c,cid)=>{ if(c.tok===s.tok){ hostSend(c,{t:'kicked'}); HOST.clients.delete(cid);} }); hostSave(); showLobby(); hostBroadcast(); } return; }
   if(id==='startOnline'){ hostStart(); return; }
-  if(id==='leaveRoom'||id==='toMenu'){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; render(); showMenu(); return; }
+  if(id==='leaveRoom'||id==='toMenu'){ if(mode==='host') lsDel('etappen-host'); stopNet(); mode='local'; G=null; SV=null; SVV=null; render(); showMenu(); return; }
   if(id==='uncover'){covered=false; viewer=G.cur; overlay(''); render(); return;}
   if(id==='nextRound'){ if(mode!=='client'){ overlay(''); startRound(); changed(); } return; }
   if(id==='again'){ if(mode!=='client'){ overlay(''); G=newGameState(G.players.map(p=>({name:p.name,ai:p.ai,tok:p.tok,av:p.av}))); if(mode==='local'){const h=humans(); viewer=h.length===1?h[0]:null;} startRound(); changed(); } return; }
@@ -1377,20 +1802,20 @@ function armOrDo(msg,fn){
   if(now-backArmed<2500){ backArmed=0; fn(); }
   else { backArmed=now; toast(msg); }
 }
-function leaveGame(){ stopNet(); mode='local'; G=null; covered=false; render(); showMenu(); toast('Spiel verlassen.'); }
+function leaveGame(){ stopNet(); mode='local'; G=null; SV=null; SVV=null; covered=false; render(); showMenu(); toast('Spiel verlassen.'); }
 function handleBack(){
   switch(ovKey){
     case 'online': case 'settings': case 'privacy': case 'setup': readName(); showMenu(); return;
-    case 'rules': { const b=$('rulesBack'); if(b) b.click(); return; }
+    case 'rules': { const b=$('rulesBack')||$('svRulesBack'); if(b) b.click(); return; }
     case 'avatar': closeAvatarEditor(); return;
     case 'skip': overlay(''); render(); return;
     case 'wait': case 'notfound': leaveToMenu(); return;
     case 'menu':
-      if(G){ overlay(''); render(); return; }   // zurück ins laufende Spiel
+      if(G||svActive()){ overlay(''); render(); return; }   // zurück ins laufende Spiel
       armOrDo('Nochmal zurück wischen, um die App zu schließen.',()=>{ exiting=true; history.go(-2); });
       return;
   }
-  if(G||ovKey==='lobby'||ovKey==='cover'||ovKey.startsWith('end')){
+  if(G||svActive()||ovKey==='lobby'||ovKey==='cover'||ovKey.startsWith('end')||ovKey.startsWith('svend')){
     armOrDo(mode==='local'?'Nochmal zurück wischen, um das Spiel zu verlassen.':'Nochmal zurück wischen, um den Raum zu verlassen.', leaveGame);
     return;
   }
