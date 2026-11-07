@@ -324,6 +324,21 @@ button.sv-cell:hover{background:rgba(255,255,255,.32)}
   .tabletop{margin-bottom:40px}
 }
 
+/* Effekte über dem Tisch */
+.fxburst{position:fixed; z-index:17; font-family:var(--f-display); font-size:clamp(1.6rem,7vw,3.2rem); color:#fff; white-space:nowrap; pointer-events:none;
+  text-shadow:0 3px 0 rgba(0,0,0,.45), 0 0 18px rgba(0,0,0,.35); -webkit-text-stroke:1px rgba(0,0,0,.35)}
+.fxburst.warn{color:#ffd43b} .fxburst.red{color:#ff6b6b} .fxburst.ok{color:#8ce99a}
+.fxburst.suit0,.fxburst.suit1{color:#fff} .fxburst.suit2,.fxburst.suit3{color:#ff6b6b}
+.fxbubble{position:fixed; z-index:17; pointer-events:none; background:#fff; color:#1d1b26; font-family:var(--f-display); font-size:1.1rem; padding:6px 14px; border-radius:16px; box-shadow:0 6px 16px rgba(0,0,0,.3)}
+.fxbubble::after{content:""; position:absolute; left:50%; bottom:-8px; margin-left:-8px; border:8px solid transparent; border-top-color:#fff; border-bottom:0}
+.confetti{position:fixed; width:8px; height:13px; border-radius:2px; z-index:41; pointer-events:none}
+@media (hover:hover){ .hand .card:not(.sel):not(.incoming):hover{transform:translateY(-6px)} }
+.mm .hand .card.can,.dock .hand .card.mm.can{animation:canglow 1.8s ease-in-out infinite}
+@keyframes canglow{0%,100%{box-shadow:0 0 0 3px var(--hl), var(--shadow)} 50%{box-shadow:0 0 0 5px color-mix(in srgb,var(--hl) 55%,transparent), 0 6px 14px rgba(0,0,0,.25)}}
+#mmTop.land,#discSlot .card.land{animation:landpile .35s cubic-bezier(.2,.9,.3,1.3)}
+@keyframes landpile{0%{transform:scale(1.15) rotate(-6deg)} 100%{transform:none}}
+@media (prefers-reduced-motion: reduce){ .dock .hand .card.mm.can,#mmTop.land{animation:none} }
+
 /* Kartenrücken-Designs */
 .card.back.bk0{background:repeating-linear-gradient(135deg,#1f7a55 0 5px,#145c3f 5px 10px); border-color:#0e3f2b}
 .card.back.bk1{background:linear-gradient(45deg,#7a1622 25%,transparent 25% 75%,#7a1622 75%) 0 0/12px 12px, linear-gradient(45deg,#7a1622 25%,#b02a37 25% 75%,#7a1622 75%) 6px 6px/12px 12px; border-color:#5a0f18}

@@ -1,7 +1,7 @@
 /* Spielhafen – Etappen-Rommé & Schiffe versenken: Spiellogik, Online-Modus (verschlüsselt über MQTT) und Oberfläche */
 (function(){
 'use strict';
-const APP_VERSION='1.9.1';
+const APP_VERSION='1.10.1';
 const PROTO=8;                  // Netzwerk-Protokoll; Gastgeber und Mitspieler müssen gleich sein
 const CODE_LEN=8;                    // Raum-Code, angezeigt als XXXX-XXXX
 const MAX_CONNS=12;                  // Spieler + Zuschauer pro Raum
@@ -905,7 +905,7 @@ function snapState(){
   const me=mySeat(), v=me!=null&&!covered?G.players[me]:null;
   return {round:G.round, me:v?me:null, myIds:v?v.hand.map(c=>c.id):[], counts:G.players.map(p=>p.hand.length),
     discLen:G.disc.length, discTop:G.disc.length?G.disc[G.disc.length-1].id:null, cur:G.cur, stage:G.stage,
-    laidIds:new Set(G.players.flatMap(p=>p.laid?p.laid.flatMap(g=>g.cards.map(c=>c.id)):[]))};
+    laidIds:new Set(G.players.flatMap(p=>p.laid?p.laid.flatMap(g=>g.cards.map(c=>c.id)):[])), laidP:G.players.map(p=>!!p.laid)};
 }
 function captureRects(){
   const r={hand:{},pl:{},deck:null,disc:null};
@@ -957,6 +957,7 @@ function runAnims(prev,now,before){
     if(t) fly(backOf(G.players[i].av), tookDisc&&prev.cur===i?discR:deckR, t, {dur:420, fade:true});
   });
   if(now.cur!==prev.cur&&myTurn()&&G.stage==='draw') showTurnBanner();
+  now.laidP.forEach((l,i)=>{ if(l&&prev.laidP&&!prev.laidP[i]&&G.players[i]) fxBurst(i===now.me?'Etappe geschafft!':`${G.players[i].name}: Etappe geschafft!`,'ok'); });
 }
 function deal(now){
   const deckEl=$('deckSlot').firstElementChild; if(!deckEl) return;
@@ -1327,6 +1328,7 @@ function renderSV(){
     if(ovKey!==k&&!['rules','menu','settings','privacy','online','avatar'].includes(ovKey)){
       const w=V.players[V.winner], canGo=mode!=='client';
       const rows=V.players.map(p=>`<tr><td><span class="who">${avatarSVG(p.av,26)}${esc(p.name)}</span></td><td>${p.shots}</td><td>${p.hitsMade}</td><td>${p.shots?Math.round(p.hitsMade/p.shots*100):0} %</td></tr>`).join('');
+      confetti('sv'+V.round);
       setTimeout(()=>{ if(svActive()&&curSvView().phase==='over'&&ovKey!==k) overlay(`<div class="center-av winner">${avatarSVG(w.av,110,'av av-xl')}</div><h2>${esc(w.name)} gewinnt!</h2><p>Die ganze Flotte liegt auf dem Meeresgrund.</p><table><tr><th>Spieler</th><th>Schüsse</th><th>Treffer</th><th>Quote</th></tr>${rows}</table>${canGo?'':`<p class="note">Warte, ob ${esc((CLIENT&&CLIENT.hostName)||'der Gastgeber')} eine Revanche startet.</p>`}<div class="row mt">${canGo?'<button class="btn primary" id="svAgain">Revanche</button>':''}<button class="btn" id="toMenu">Zum Menü</button></div>`,k); }, animOff?0:900);
     }
   } else if(ovKey.startsWith('svend')) overlay('');
@@ -1501,7 +1503,7 @@ function maybeMmAI(){
   setTimeout(()=>{ mmAiBusy=false; if(MM!==my||MM.phase!=='play'||!MM.players[MM.cur].ai) return;
     const seat=MM.cur, err=mmApply(seat,mmAiMove(MM,seat));
     if(err) mmApply(seat,MM.drawn!=null?{type:'pass'}:{type:'draw'});
-    mmChanged(); }, animOff?350:900);
+    mmChanged(); }, (animOff?350:900)+(MM.log.length===0&&animOK()?MM.rules.hand*MM.players.length*60+600:0));
 }
 /* Wer schaut aufs Gerät? (an einem Gerät mit mehreren Menschen) */
 function mmUpdateViewer(){
@@ -1542,8 +1544,105 @@ function mmCardHTML(c,cls='',attrs=''){
   return `<button class="card mm s${s} ${cls}" ${attrs} aria-label="${MM_SUITNAME[s]} ${r}"><span class="tl">${r}</span><span class="n">${r}</span><span class="s">${MM_SUITS[s]}</span></button>`;
 }
 const mmSortKey=c=>c.s*20+MM_R52.indexOf(c.r);
+/* ---------- Mau-Mau-Animationen ---------- */
+let prevMm=null, mmIncoming=new Set(), mmDiscIncoming=false;
+const animOK=()=>!reduceMotion.matches&&!animOff&&!document.hidden;
+function mmSeatRect(i){ return rectOf(document.querySelector(`#mmSeats [data-pl="${i}"] .bfan .fc:last-of-type`)||document.querySelector(`#mmSeats [data-pl="${i}"] svg.av`)); }
+function mmCapture(){
+  const r={hand:{},seat:{},deck:rectOf($('mmDeckBtn')),disc:rectOf($('mmTop'))};
+  document.querySelectorAll('#hand [data-mmc]').forEach(el=>{ r.hand[el.dataset.mmc]=el.getBoundingClientRect(); });
+  document.querySelectorAll('#mmSeats [data-pl]').forEach(el=>{ r.seat[el.dataset.pl]=rectOf(el.querySelector('.bfan .fc:last-of-type')||el.querySelector('svg.av')); });
+  return r;
+}
+function mmReveal(id){ mmIncoming.delete(id); const el=document.querySelector(`#hand [data-mmc="${id}"]`); if(el){ el.classList.remove('incoming'); el.classList.add('land'); } }
+function mmRevealDisc(V){ mmDiscIncoming=false; const d=$('mmTop'); if(d){ d.classList.remove('incoming'); d.classList.add('land'); } }
+/* großer Schriftzug über dem Tisch */
+function fxBurst(text,cls,rect){
+  if(!animOK()) return;
+  const r=rect||rectOf($('mm').hidden?$('tableR'):$('tableM'))||{left:innerWidth/2,top:innerHeight/2,width:0,height:0};
+  const el=document.createElement('div'); el.className='fxburst '+(cls||''); el.textContent=text;
+  el.style.left=(r.left+r.width/2)+'px'; el.style.top=(r.top+r.height/2)+'px';
+  $('fx').appendChild(el);
+  try{ el.animate([{transform:'translate(-50%,-50%) scale(.3) rotate(-8deg)',opacity:0},{transform:'translate(-50%,-50%) scale(1.15) rotate(2deg)',opacity:1,offset:.25},{transform:'translate(-50%,-50%) scale(1) rotate(0)',opacity:1,offset:.7},{transform:'translate(-50%,-75%) scale(.95)',opacity:0}],{duration:1300,easing:'ease-out',fill:'both'}).onfinish=()=>el.remove(); }catch(e){ el.remove(); }
+  setTimeout(()=>el.remove(),1600);
+}
+/* Sprechblase am Platz eines Spielers */
+function fxBubble(text,rect){
+  if(!animOK()||!rect) return;
+  const el=document.createElement('div'); el.className='fxbubble'; el.textContent=text;
+  el.style.left=(rect.left+rect.width/2)+'px'; el.style.top=(rect.top)+'px';
+  $('fx').appendChild(el);
+  try{ el.animate([{transform:'translate(-50%,-80%) scale(.4)',opacity:0},{transform:'translate(-50%,-120%) scale(1.1)',opacity:1,offset:.2},{transform:'translate(-50%,-120%) scale(1)',opacity:1,offset:.8},{transform:'translate(-50%,-140%) scale(.9)',opacity:0}],{duration:1600,fill:'both'}).onfinish=()=>el.remove(); }catch(e){ el.remove(); }
+  setTimeout(()=>el.remove(),1900);
+}
+/* Konfetti zum Sieg */
+let confettiKey='';
+function confetti(key){
+  if(key&&key===confettiKey) return; confettiKey=key||'';
+  if(!animOK()) return;
+  const cols=['#ff6b6b','#ffd43b','#69db7c','#4dabf7','#da77f2','#ffa94d'];
+  for(let i=0;i<70;i++){
+    const el=document.createElement('div'); el.className='confetti';
+    el.style.background=cols[i%cols.length]; el.style.left=(10+Math.random()*80)+'vw'; el.style.top='-20px';
+    $('fx').appendChild(el);
+    const dx=(Math.random()-.5)*240, dy=innerHeight+60, rot=(Math.random()-.5)*1080, dur=1600+Math.random()*1400;
+    try{ el.animate([{transform:'translate(0,0) rotate(0)',opacity:1},{transform:`translate(${dx}px,${dy}px) rotate(${rot}deg)`,opacity:.9}],{duration:dur,delay:Math.random()*400,easing:'cubic-bezier(.25,.6,.4,1)',fill:'both'}).onfinish=()=>el.remove(); }catch(e){ el.remove(); }
+    setTimeout(()=>el.remove(),dur+700);
+  }
+}
+function mmEffectFx(V){
+  const top=V.disc[V.disc.length-1]; if(!top) return;
+  const e=mmEff(V.rules,top);
+  if(e==='draw2') fxBurst(`+${V.pend||2}`,'warn');
+  else if(e==='skip') fxBurst('⊘ Aussetzen!','red');
+  else if(e==='reverse') fxBurst('⟲ Richtungswechsel','');
+  else if(e==='wish'&&V.wish!=null) fxBurst(`${MM_SUITS[V.wish]} ${MM_SUITNAME[V.wish]}`,'suit'+V.wish);
+  else if(e==='again') fxBurst('↻ Nochmal!','');
+  else if(e==='all1') fxBurst('+1 für alle!','warn');
+}
+function mmDeal(V,me){
+  const src=rectOf($('mmDeckBtn')); if(!src) return;
+  const n=V.players.length, H=V.rules.hand, step=60;
+  const mine=[...document.querySelectorAll('#hand [data-mmc]')];
+  mine.forEach(el=>{ mmIncoming.add(+el.dataset.mmc); el.classList.add('incoming'); });
+  for(let r=0;r<H;r++) for(let k=0;k<n;k++){
+    const i=(V.cur+k)%n, delay=(r*n+k)*step;
+    if(i===me){ const el=mine[r]; if(!el) continue; const id=+el.dataset.mmc; fly(backHTML(),src,el.getBoundingClientRect(),{delay,dur:340,done:()=>mmReveal(id)}); }
+    else { const t=mmSeatRect(i); if(t) fly(backOf(V.players[i].av),src,t,{delay,dur:340,fade:true}); }
+  }
+  mine.slice(H).forEach(el=>mmReveal(+el.dataset.mmc));
+  const d=$('mmTop'); if(d){ mmDiscIncoming=true; d.classList.add('incoming'); fly(mmCardHTML(V.disc[V.disc.length-1]),src,d.getBoundingClientRect(),{delay:H*n*step,dur:380,done:()=>mmRevealDisc(V)}); }
+}
+function mmAnims(prev,now,before,V){
+  if(!now||!animOK()) return;
+  if(!prev||prev.round!==now.round||prev.n!==now.n){ if(V.phase==='play'&&V.last&&V.last.type==='start') mmDeal(V,now.me); return; }
+  const deckR=before.deck||rectOf($('mmDeckBtn')), discEl=$('mmTop');
+  if(now.top!==prev.top&&now.lastN!==prev.lastN&&discEl){
+    const by=V.last?V.last.by:null, src=before.hand[now.top]||(by!=null?before.seat[by]:null)||deckR;
+    mmDiscIncoming=true; discEl.classList.add('incoming');
+    fly(mmCardHTML(V.disc[V.disc.length-1]),src,discEl.getBoundingClientRect(),{dur:430,done:()=>{ mmRevealDisc(V); mmEffectFx(V); }});
+  }
+  if(now.me!=null&&prev.me===now.me){
+    const old=new Set(prev.myIds);
+    now.myIds.filter(id=>!old.has(id)).slice(0,8).forEach((id,k)=>{
+      const el=document.querySelector(`#hand [data-mmc="${id}"]`); if(!el) return;
+      mmIncoming.add(id); el.classList.add('incoming');
+      fly(backHTML(),deckR,el.getBoundingClientRect(),{delay:k*120,dur:420,done:()=>mmReveal(id)});
+    });
+  }
+  now.counts.forEach((c,i)=>{
+    if(i===now.me) return;
+    const diff=c-(prev.counts[i]||0);
+    if(diff>0){ const t=mmSeatRect(i); if(t) for(let k=0;k<Math.min(diff,6);k++) fly(backOf(V.players[i].av),deckR,t,{delay:k*120,dur:420,fade:true}); }
+    if(c===1&&prev.counts[i]!==1&&V.phase==='play') setTimeout(()=>fxBubble('Mau!',mmSeatRect(i)||before.seat[i]),450);
+  });
+  if(now.me!=null&&now.counts[now.me]===1&&prev.counts[now.me]!==1&&V.phase==='play') setTimeout(()=>fxBubble('Mau!',rectOf(document.querySelector('#mmSeats .seat.me .seat-who'))),450);
+  if(now.phase==='over'&&prev.phase!=='over'){ setTimeout(()=>{ fxBurst('Mau-Mau!','warn'); confetti('mm'+V.round); },450); }
+}
+
 function renderMM(){
   const V=curMmView(); if(!V) return;
+  const before=mmCapture();
   const me=mode==='client'?V.you:mmSeat(), covered=mode==='local'&&mmPendViewer!=null;
   const mine=V.phase==='play'&&V.cur===me&&me!=null&&!covered;
   const R=V.rules, top=V.disc[V.disc.length-1];
@@ -1559,7 +1658,7 @@ function renderMM(){
   layoutTable($('tableM'));
   $('mmDeck').innerHTML=`<button class="card big back${mine&&V.drawn==null?' can':''}" id="mmDeckBtn" aria-label="Karte ziehen"></button>`;
   $('mmDeckN').textContent=`Stapel · ${V.deckN}`;
-  $('mmDisc').innerHTML=mmCardHTML(top,'big land','id="mmTop" tabindex="-1"');
+  $('mmDisc').innerHTML=mmCardHTML(top,'big'+(mmDiscIncoming?' incoming':''),'id="mmTop" tabindex="-1"');
   $('mmInfo').innerHTML=V.pend>0?`<span class="mm-tag warn">+${V.pend} ziehen!</span>`:V.wish!=null?`<span class="mm-tag s${V.wish}">Wunsch: ${MM_SUITS[V.wish]} ${MM_SUITNAME[V.wish]}</span>`:`<span class="mm-tag">${V.dir===1?'↻ im Uhrzeigersinn':'↺ gegen den Uhrzeigersinn'}</span>`;
   let msg='',sub='';
   if(V.phase==='over') msg=`${V.players[V.winner].name} gewinnt die Runde!`;
@@ -1578,7 +1677,7 @@ function renderMM(){
     const hand=[...V.hand].sort((a,b)=>mmSortKey(a)-mmSortKey(b));
     const showMau=R.mau&&mine&&V.hand.length===2;
     $('req').innerHTML=`<span class="chip">${esc(mmSummary(R))}</span>`;
-    $('hand').innerHTML=hand.map(c=>{ const ok=mine&&mmCanPlay(V,c)&&(V.drawn==null||c.id===V.drawn); return mmCardHTML(c,(ok?'can':(mine?'dim':''))+(c.id===V.drawn?' sel':''),`data-mmc="${c.id}"`); }).join('');
+    $('hand').innerHTML=hand.map(c=>{ const ok=mine&&mmCanPlay(V,c)&&(V.drawn==null||c.id===V.drawn); return mmCardHTML(c,(ok?'can':(mine?'dim':''))+(c.id===V.drawn?' sel':'')+(mmIncoming.has(c.id)?' incoming':''),`data-mmc="${c.id}"`); }).join('');
     const a=[];
     if(mine){
       if(showMau) a.push(`<button class="btn mau-btn${mmMauArmed?' on':''}" id="mmMau">${mmMauArmed?'„Mau!“ gesagt ✓':'„Mau“ sagen!'}</button>`);
@@ -1587,8 +1686,14 @@ function renderMM(){
     }
     $('actions').innerHTML=a.join('');
   }
-  if(mine&&mmPrevCur!==me&&meP) showTurnBanner(meP.av);
+  if(mine&&mmPrevCur!==me&&meP){
+    const dealing=(!prevMm||prevMm.round!==V.round)&&V.last&&V.last.type==='start'&&animOK();
+    if(dealing){ const av=meP.av; setTimeout(()=>{ const W=curMmView(); if(W&&W.cur===me&&W.phase==='play') showTurnBanner(av); }, R.hand*V.players.length*60+500); }
+    else showTurnBanner(meP.av);
+  }
   mmPrevCur=V.phase==='play'?(covered?null:V.cur):null;
+  const nowMm={round:V.round,n:V.players.length,me:meP&&!covered?me:null,myIds:V.hand.map(c=>c.id),counts:V.players.map(p=>p.n),top:top?top.id:null,lastN:V.last?V.last.n:0,phase:V.phase};
+  mmAnims(prevMm,nowMm,before,V); prevMm=nowMm;
   // Rundenende
   if(V.phase==='over'){
     const k='mmend'+V.round;
@@ -1659,7 +1764,7 @@ function render(){
     $('players').innerHTML=''; $('board').hidden=true; $('sv').hidden=true; $('mm').hidden=false; $('dock').hidden=false;
     prevSnap=null; renderMM(); measureDock(); return;
   }
-  $('mm').hidden=true; mmPrevCur=null;
+  $('mm').hidden=true; mmPrevCur=null; prevMm=null; mmIncoming.clear(); mmDiscIncoming=false;
   if(svActive()){
     $('players').innerHTML=''; $('dock').hidden=true; $('board').hidden=true; $('sv').hidden=false; measureDock();
     prevSnap=null; renderSV(); return;
@@ -1769,6 +1874,7 @@ function showCover(){
 }
 function showRoundEnd(k){
   const s=G.summary, wName=(G.players[s.wi]||{}).name||'?';
+  confetti('r'+G.round+(s.winner!=null?'x':''));
   const tbl=`<table><tr><th>Spieler</th><th>Etappe</th><th>+Pkt.</th><th>Gesamt</th></tr>${s.rows.map((r,i)=>`<tr><td><span class="who">${avatarSVG((G.players[i]||{}).av,26)}${esc(r.name)}</span></td><td>${int(r.phase,0,10,0)+1} ${r.done?'✓ geschafft':'– nochmal'}</td><td>${int(r.add,0,1e4,0)}</td><td>${int(r.total,0,1e6,0)}</td></tr>`).join('')}</table>`;
   const canGo=mode!=='client';
   const wait=canGo?'':`<p class="note">Warte, bis ${esc((CLIENT&&CLIENT.hostName)||'der Gastgeber')} weitermacht.</p>`;
